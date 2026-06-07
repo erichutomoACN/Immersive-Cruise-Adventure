@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<title>Self Check-in — Immersive Cruise Adventure</title>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<style>
+:root{
+  --bg:#fff;--bg2:#f7f7f5;--bg3:#f0efeb;
+  --text:#1a1a18;--text2:#6b6b67;--text3:#9a9a96;
+  --bd:rgba(0,0,0,0.1);--bd2:rgba(0,0,0,0.18);
+  --ok-bg:#eaf3de;--ok:#27500a;
+  --err-bg:#fcebeb;--err:#791f1f;
+  --warn-bg:#faeeda;--warn:#633806;
+  --r:12px;--f:'Segoe UI',system-ui,sans-serif;--m:'Consolas',monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:var(--f);background:var(--bg3);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
+.wrap{width:100%;max-width:420px;}
+.screen{display:none;}.screen.on{display:block;}
+.card{background:var(--bg);border-radius:var(--r);border:0.5px solid var(--bd);padding:28px;margin-bottom:12px;}
+.event-name{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.12em;margin-bottom:6px;text-align:center;}
+.card-title{font-size:22px;font-weight:600;text-align:center;margin-bottom:6px;}
+.card-sub{font-size:13px;color:var(--text2);text-align:center;margin-bottom:24px;line-height:1.6;}
+.lbl{font-size:12px;color:var(--text2);font-weight:500;margin-bottom:5px;display:block;}
+.inp{width:100%;height:52px;border:0.5px solid var(--bd2);border-radius:var(--r);padding:0 14px;font-size:20px;font-family:var(--m);background:var(--bg);color:var(--text);outline:none;text-align:center;letter-spacing:.05em;transition:border-color .15s;}
+.inp:focus{border-color:var(--text);box-shadow:0 0 0 3px rgba(0,0,0,.06);}
+.inp-hint{font-size:11px;color:var(--text3);text-align:center;margin-top:6px;}
+.btn{width:100%;height:52px;border-radius:var(--r);font-size:15px;font-family:var(--f);cursor:pointer;font-weight:500;display:flex;align-items:center;justify-content:center;gap:8px;transition:all .15s;border:none;margin-top:14px;}
+.btn-p{background:var(--text);color:var(--bg);}
+.btn-p:hover{opacity:.85;}
+.btn-p:active{transform:scale(.98);}
+.btn-o{background:var(--bg);color:var(--text);border:0.5px solid var(--bd2);}
+.btn-o:hover{background:var(--bg2);}
+.btn:disabled{opacity:.5;cursor:not-allowed;}
+.err-b{background:var(--err-bg);color:var(--err);padding:12px 14px;border-radius:var(--r);font-size:13px;display:none;align-items:center;gap:8px;margin-top:12px;line-height:1.6;}
+.err-b.on{display:flex;}
+.warn-b{background:var(--warn-bg);color:var(--warn);padding:12px 14px;border-radius:var(--r);font-size:13px;display:none;align-items:center;gap:8px;margin-top:12px;line-height:1.6;}
+.warn-b.on{display:flex;}
+.spin{width:18px;height:18px;border:2.5px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .6s linear infinite;flex-shrink:0;}
+@keyframes sp{to{transform:rotate(360deg)}}
+.bp-outer{background:var(--bg3);border-radius:var(--r);padding:14px;}
+#bp-card{background:var(--bg);border-radius:var(--r);overflow:hidden;border:0.5px solid var(--bd);}
+.bp-head{background:var(--text);color:var(--bg);padding:20px 22px 16px;}
+.bp-ev{font-size:10px;letter-spacing:.14em;text-transform:uppercase;opacity:.6;margin-bottom:6px;}
+.bp-name{font-size:22px;font-weight:700;line-height:1.2;margin-bottom:4px;}
+.bp-eid{font-size:12px;opacity:.55;font-family:var(--m);}
+.bp-body{padding:20px 22px;}
+.bp-row{display:flex;gap:14px;margin-bottom:16px;}
+.bpf{flex:1;}
+.bpf-label{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;}
+.bpf-value{font-size:16px;font-weight:600;}
+.bp-divider{border:none;border-top:1px dashed rgba(0,0,0,0.12);margin:16px 0;}
+.bp-sr-row{display:flex;align-items:center;justify-content:space-between;}
+.bp-sr-label{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;}
+.bp-sr-num{font-size:52px;font-weight:700;font-family:var(--m);letter-spacing:-2px;line-height:1;}
+.bp-bars{display:flex;gap:2px;align-items:flex-end;}
+.bp-bar{background:var(--text);border-radius:1px;}
+.bp-footer{background:var(--bg2);padding:12px 22px;display:flex;align-items:center;justify-content:space-between;}
+.bp-fl{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px;}
+.bp-fv{font-size:12px;font-weight:500;}
+.jalur-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:3px 9px;border-radius:99px;font-weight:500;background:var(--ok-bg);color:var(--ok);}
+.ok-banner{background:var(--ok-bg);color:var(--ok);padding:12px 16px;border-radius:var(--r);font-size:14px;font-weight:500;display:flex;align-items:center;gap:8px;margin-bottom:12px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- INPUT EID -->
+<div id="sc-input" class="screen on">
+  <div class="card">
+    <div class="event-name">IMMERSIVE CRUISE ADVENTURE</div>
+    <div class="card-title">Self Check-in</div>
+    <div class="card-sub">Enter your Employee ID to receive your stateroom assignment.</div>
+    <label class="lbl">Your Employee ID</label>
+    <input type="text" class="inp" id="eid-inp"
+      placeholder="firstname.lastname"
+      autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+      onkeydown="if(event.key==='Enter')doCheckin()"/>
+    <div class="inp-hint">Example: john.doe</div>
+    <button class="btn btn-p" id="ci-btn" onclick="doCheckin()">Check in now</button>
+    <div id="ci-err" class="err-b"></div>
+    <div id="ci-warn" class="warn-b"></div>
+  </div>
+</div>
+
+<!-- BOARDING PASS -->
+<div id="sc-bp" class="screen">
+  <div class="ok-banner">✓ Check-in successful!</div>
+  <div class="bp-outer">
+    <div id="bp-card">
+      <div class="bp-head">
+        <div class="bp-ev">IMMERSIVE CRUISE ADVENTURE</div>
+        <div class="bp-name" id="bp-name">—</div>
+        <div class="bp-eid" id="bp-eid">—</div>
+      </div>
+      <div class="bp-body">
+        <div class="bp-row">
+          <div class="bpf">
+            <div class="bpf-label">Deck</div>
+            <div class="bpf-value" id="bp-deck">—</div>
+          </div>
+          <div class="bpf">
+            <div class="bpf-label">Check-in via</div>
+            <div class="bpf-value"><span class="jalur-badge">✓ Self Check-in</span></div>
+          </div>
+        </div>
+        <hr class="bp-divider"/>
+        <div class="bp-sr-row">
+          <div>
+            <div class="bp-sr-label">Your Stateroom</div>
+            <div class="bp-sr-num" id="bp-sr">—</div>
+          </div>
+          <div class="bp-bars" id="bp-bars"></div>
+        </div>
+      </div>
+      <div class="bp-footer">
+        <div>
+          <div class="bp-fl">Event</div>
+          <div class="bp-fv">Immersive Cruise Adventure</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="bp-fl">Time</div>
+          <div class="bp-fv" id="bp-time">—</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <button class="btn btn-p" id="dl-btn" onclick="downloadBP()" style="margin-top:12px;">↓ Download boarding pass</button>
+  <button class="btn btn-o" onclick="reset()" style="margin-top:8px;">Check in another person</button>
+</div>
+
+</div>
+<script>
+// ── CONFIG ────────────────────────────────────────────────────
+// Apps Script URL — same endpoint as panitia app
+var API    = "https://script.google.com/macros/s/AKfycbzmPO-0juq9uQwDvGZN96c3gUnB0uL0dEaUXKNJsOeAe7dM-blCrOS2OEvCILSMJNoi/exec";
+var DEVICE = "Self-" + Math.random().toString(36).slice(2,5).toUpperCase();
+
+// ── CHECK-IN ─────────────────────────────────────────────────
+async function doCheckin() {
+  var eid   = (document.getElementById('eid-inp').value || '').trim().toLowerCase();
+  var errEl = document.getElementById('ci-err');
+  var wrnEl = document.getElementById('ci-warn');
+  errEl.classList.remove('on');
+  wrnEl.classList.remove('on');
+
+  if (!eid) {
+    showErr('Please enter your Employee ID.');
+    return;
+  }
+
+  setBtn(true);
+
+  try {
+    // Step 1: lookup — verify EID exists and not yet checked in
+    var lookup = await get('?action=lookup&eid=' + encodeURIComponent(eid));
+
+    if (!lookup.ok) {
+      if (lookup.error === 'not_found') {
+        showErr('Employee ID not found. Please check and try again.<br>Example: <strong>john.doe</strong>');
+      } else if (lookup.error === 'already_checkedin') {
+        showWarn('You have already checked in' +
+          (lookup.name ? ', <strong>' + lookup.name + '</strong>' : '') +
+          '. Please show your stateroom to the staff.');
+      } else {
+        showErr('Error: ' + (lookup.error || 'Unknown'));
+      }
+      setBtn(false); return;
+    }
+
+    // Step 2: check-in — Apps Script handles slot assignment (same as panitia)
+    var res = await post({
+      action:  'checkin',
+      name:    lookup.name,
+      eid:     lookup.eid,
+      jalur:   'Self Check-in',
+      device:  DEVICE
+    });
+
+    if (!res.ok) {
+      if (res.error === 'already_checkedin') {
+        showWarn('You have already checked in from another device. Please see the registration desk.');
+      } else {
+        showErr('Check-in failed. Please visit the registration desk. (' + (res.error||'') + ')');
+      }
+      setBtn(false); return;
+    }
+
+    // Step 3: show boarding pass
+    var sr = Number(res.bp.stateroom);
+    var dk = String(res.bp.deck);
+    // Safety: ensure 3-digit stateroom
+    if (sr > 0 && sr < 100) sr = (parseInt(dk) * 100) + sr;
+
+    showBP(lookup.name, lookup.eid, dk, sr);
+
+  } catch(e) {
+    showErr('Connection failed. Please check your internet and try again.');
+  }
+  setBtn(false);
+}
+
+function showBP(name, eid, deck, stateroom) {
+  document.getElementById('bp-name').textContent = name;
+  document.getElementById('bp-eid').textContent  = 'EID: ' + eid;
+  document.getElementById('bp-deck').textContent = 'Deck ' + deck;
+  document.getElementById('bp-sr').textContent   = stateroom;
+  document.getElementById('bp-time').textContent = new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+
+  var bars = document.getElementById('bp-bars');
+  bars.innerHTML = '';
+  [22,32,18,36,22,32,18,40,22,32,18,28,36,22,32].forEach(function(h,i){
+    var b = document.createElement('div');
+    b.className   = 'bp-bar';
+    b.style.width  = (i%3===0?3:1.5)+'px';
+    b.style.height = h+'px';
+    bars.appendChild(b);
+  });
+
+  document.getElementById('sc-input').classList.remove('on');
+  document.getElementById('sc-bp').classList.add('on');
+}
+
+async function downloadBP() {
+  var btn = document.getElementById('dl-btn');
+  btn.textContent = 'Preparing...'; btn.disabled = true;
+  try {
+    var canvas = await html2canvas(document.getElementById('bp-card'),{
+      scale:3, backgroundColor:'#ffffff', useCORS:true
+    });
+    var a = document.createElement('a');
+    a.download = 'stateroom-' + document.getElementById('bp-sr').textContent + '.png';
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+  } catch(e) {
+    alert('Download failed. Please take a screenshot manually.');
+  }
+  btn.innerHTML = '↓ Download boarding pass'; btn.disabled = false;
+}
+
+function reset() {
+  document.getElementById('eid-inp').value = '';
+  document.getElementById('ci-err').classList.remove('on');
+  document.getElementById('ci-warn').classList.remove('on');
+  document.getElementById('sc-bp').classList.remove('on');
+  document.getElementById('sc-input').classList.add('on');
+  document.getElementById('eid-inp').focus();
+}
+
+// ── HELPERS ──────────────────────────────────────────────────
+function setBtn(loading) {
+  var btn = document.getElementById('ci-btn');
+  btn.disabled = loading;
+  btn.innerHTML = loading ? '<div class="spin"></div> Processing...' : 'Check in now';
+}
+function showErr(msg) {
+  var el = document.getElementById('ci-err');
+  el.innerHTML = '<span>⚠</span><span>' + msg + '</span>';
+  el.classList.add('on');
+}
+function showWarn(msg) {
+  var el = document.getElementById('ci-warn');
+  el.innerHTML = '<span>ℹ</span><span>' + msg + '</span>';
+  el.classList.add('on');
+}
+async function get(query) {
+  var r = await fetch(API + query, {redirect:'follow'});
+  return r.json();
+}
+async function post(body) {
+  var r = await fetch(API, {
+    method:  'POST',
+    redirect:'follow',
+    headers: {'Content-Type':'text/plain'},
+    body:    JSON.stringify(body)
+  });
+  return r.json();
+}
+</script>
+</body>
+</html>
