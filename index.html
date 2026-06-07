@@ -59,8 +59,16 @@ const fmt = s => { s=Math.max(0,s); return pad(s/60)+':'+pad(s%60); };
 const wc = len => len===0?'wt-green':len<=3?'wt-amber':'wt-red';
 const fc = len => len===0?'qf-green':len<=3?'qf-amber':'qf-red';
 const ws = (len,dur) => len===0?'OPEN':'~'+(len*dur)+'m';
-const toArr = obj => obj ? Object.values(obj).sort((a,b)=>a.num-b.num) : [];
-const getPosState = id => fbState['pos_'+id] || {duration:8,queue:{},timerRunning:false,timerEnd:null,nextNum:0};
+const toArr = obj => obj ? Object.values(obj).filter(i=>i&&i.num&&i.deck).sort((a,b)=>(a.sortKey||a.num)-(b.sortKey||b.num)) : [];
+const getPosState = id => {
+  const ps = fbState['pos_'+id] || {duration:8,queue:{},timerRunning:false,timerEnd:null,nextNum:0,duoMode:false,activeDuo:false};
+  if(ps.queue && typeof ps.queue==='object'){
+    const clean={};
+    Object.entries(ps.queue).forEach(([k,v])=>{ if(v&&v.deck&&v.num) clean[k]=v; });
+    ps.queue=clean;
+  }
+  return ps;
+};
 
 // ── SCREENS ──
 const showScreen = id => { document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); document.getElementById(id)?.classList.add('active'); };
@@ -88,9 +96,19 @@ async function init(){
   try {
     const s = await fbGet('state');
     if(!s){
+      // First time setup
       const init = {};
-      POS_DEFS.forEach(p => { init['pos_'+p.id] = {duration:8,queue:{},timerRunning:false,timerEnd:null,nextNum:0}; });
+      POS_DEFS.forEach(p => { init['pos_'+p.id] = {duration:8,queue:{},timerRunning:false,timerEnd:null,nextNum:0,duoMode:false,activeDuo:false}; });
       await fbSet('state', init);
+    } else {
+      // Migrate existing state — add missing fields without overwriting
+      const migUpdates = {};
+      POS_DEFS.forEach(p => {
+        const existing = s['pos_'+p.id] || {};
+        if(existing.duoMode === undefined) migUpdates['state/pos_'+p.id+'/duoMode'] = false;
+        if(existing.activeDuo === undefined) migUpdates['state/pos_'+p.id+'/activeDuo'] = false;
+      });
+      if(Object.keys(migUpdates).length) await update(ref(db), migUpdates);
     }
     fbState = (await fbGet('state')) || {};
     hideLoading(); showScreen('screen-role');
@@ -196,6 +214,52 @@ window.navDeckConfirm = async function(){
     if(document.getElementById('nav-view-tickets').classList.contains('active')) renderTix();
     if(document.getElementById('nav-view-reserve').classList.contains('active')) renderPosList();
   });
+  // Notifications listener
+  if(!window._lastNotifTs) window._lastNotifTs = {};
+  var lastNotifTs = window._lastNotifTs;
+  fbOn('notifications', s => {
+    if(!s||!navDeck) return;
+    Object.values(s).forEach(n => {
+      if(!n||!n.ts) return;
+      const key = n.posId+'_'+n.ts;
+      if(lastNotifTs[key]) return;
+      lastNotifTs[key] = true;
+      const posName = POS_DEFS[n.posId-1].name;
+      if((n.type==='pair'||n.type==='paired') && (n.deck1===navDeck||n.deck2===navDeck)){
+        const partner = n.deck1===navDeck ? n.deck2 : n.deck1;
+        showNotif('🤝 You will play with DECK '+partner+' at '+posName+'!','success');
+      }
+      if(n.type==='standby' && n.decks && n.decks.includes(navDeck)){
+        showNotif('⚡ Get ready! Head to '+posName+' — your turn is coming up!','warning');
+      }
+    });
+    // Re-render tickets to show updated pairedWith info
+    if(document.getElementById('nav-view-tickets')?.classList.contains('active')) renderTix();
+    renderFairnessBar();;
+  });
+  // Listen to notifications for this navigator
+  if(!window._lastNotifTs) window._lastNotifTs = {};
+  var lastNotifTs = window._lastNotifTs;
+  fbOn('notifications', s => {
+    if(!s) return;
+    Object.values(s).forEach(n => {
+      if(!n || !n.ts) return;
+      const key = n.posId+'_'+n.ts;
+      if(lastNotifTs[key]) return; // already shown
+      lastNotifTs[key] = true;
+      const posName = POS_DEFS[n.posId-1].name;
+      if((n.type==='pair'||n.type==='paired') && (n.deck1===navDeck||n.deck2===navDeck)){
+        const partner = n.deck1===navDeck ? n.deck2 : n.deck1;
+        showNotif('🤝 You will play with DECK '+partner+' at '+posName+'!','success');
+      }
+      if(n.type==='standby' && n.decks && n.decks.includes(navDeck)){
+        showNotif('⚡ Get ready! Head to '+posName+' — your turn is coming up!','warning');
+      }
+    });
+    // Re-render tickets to show updated pairedWith info
+    if(document.getElementById('nav-view-tickets')?.classList.contains('active')) renderTix();
+    renderFairnessBar();;
+  });
   renderFairnessBar(); renderNavStatus();
   // Count how many stations this deck has entries in
   const count = POS_DEFS.filter(def => toArr(getPosState(def.id).queue).some(i=>i.deck===navDeck)).length;
@@ -251,6 +315,8 @@ window.navConfirmRegister = async function(posId){
   const q = toArr(ps.queue);
   await fbUpdate('state/pos_'+posId, {nextNum:num});
   await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:navDeck,status:q.length===0?'playing':'waiting',method:'app'});
+  // Auto-pair if duo mode on
+  if(ps.duoMode) await autoPair(posId);
   showNotif('Queue #'+String(num).padStart(2,'0')+' — '+def.name,'success');
   resetSteps();
   navTab('tickets', document.querySelectorAll('#screen-nav .tab')[1]);
@@ -276,43 +342,80 @@ window.startTimer = async function(posId){
   const q = toArr(ps.queue);
   if(!q.length||ps.timerRunning) return;
   const timerEnd = Date.now()+(ps.duration||8)*60000;
-  await fbUpdate('state/pos_'+posId, {timerRunning:true,timerEnd});
+  const isDuo = ps.duoMode && q.length>=2;
+  await fbUpdate('state/pos_'+posId, {timerRunning:true, timerEnd, activeDuo:isDuo});
   await fbUpdate('state/pos_'+posId+'/queue/'+q[0].num, {status:'playing'});
+  if(isDuo) await fbUpdate('state/pos_'+posId+'/queue/'+q[1].num, {status:'playing'});
 };
 
-window.adminEndSession = async function(posId, result){
+window.startTimerSolo = async function(posId){
+  // Force solo start even when duo mode is on — partner skipped
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  if(!q.length||ps.timerRunning) return;
+  const timerEnd = Date.now()+(ps.duration||8)*60000;
+  await fbUpdate('state/pos_'+posId, {timerRunning:true, timerEnd, activeDuo:false});
+  await fbUpdate('state/pos_'+posId+'/queue/'+q[0].num, {status:'playing'});
+  showNotif('Solo session started — Deck '+q[0].deck,'success');
+};
+
+window.adminEndSession = async function(posId, result, deckNum){
+  // deckNum is optional — if provided, only end that specific deck (duo individual result)
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
   if(!q.length) return;
-  const deck = q[0].deck;
   const ts = Date.now();
-  // Save result + timestamp together
-  await fbSet('results/'+deck+'/pos_'+posId, { result, ts });
-  await adminNext(posId, false);
-  showNotif('Deck '+deck+' — '+result.toUpperCase()+' at '+POS_DEFS[posId-1].name, result==='passed'?'success':'warning');
+  const wasDuo = ps.activeDuo && q.length>=2 && q[1].status==='playing';
+
+  if(deckNum){
+    // Individual result for one deck in a duo
+    await fbSet('results/'+deckNum+'/pos_'+posId, {result, ts});
+    showNotif('Deck '+deckNum+' — '+result.toUpperCase(), result==='passed'?'success':'warning');
+    // Check if both decks now have results — if so, advance queue
+    const otherDeck = q[0].deck===deckNum ? (q[1]?q[1].deck:null) : q[0].deck;
+    if(otherDeck){
+      const otherResult = await fbGet('results/'+otherDeck+'/pos_'+posId);
+      if(otherResult) await adminNext(posId, false); // both done
+    }
+  } else {
+    // Same result for all active decks
+    await fbSet('results/'+q[0].deck+'/pos_'+posId, {result, ts});
+    if(wasDuo) await fbSet('results/'+q[1].deck+'/pos_'+posId, {result, ts});
+    await adminNext(posId, false);
+    const names = wasDuo&&q[1] ? 'Deck '+(q[0].deck||'?')+' & '+(q[1].deck||'?') : 'Deck '+(q[0].deck||'?');
+    showNotif(names+' — '+result.toUpperCase(), result==='passed'?'success':'warning');
+  }
 };
 
 async function adminNext(posId, auto){
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
   if(!q.length) return;
+  const wasDuo = ps.activeDuo && q.length>=2 && q[1].status==='playing';
+  // Remove first (and second if duo)
   await fbDel('state/pos_'+posId+'/queue/'+q[0].num);
-  await fbUpdate('state/pos_'+posId, {timerRunning:false,timerEnd:null});
-  if(q.length>1){
-    await fbUpdate('state/pos_'+posId+'/queue/'+q[1].num, {status:'playing'});
-    chkQNotif(posId, q[1].deck);
+  if(wasDuo) await fbDel('state/pos_'+posId+'/queue/'+q[1].num);
+  await fbUpdate('state/pos_'+posId, {timerRunning:false, timerEnd:null, activeDuo:false});
+  // Promote next in line
+  const remaining = q.slice(wasDuo?2:1);
+  if(remaining.length>0){
+    await fbUpdate('state/pos_'+posId+'/queue/'+remaining[0].num, {status:'playing'});
+    chkQNotif(posId, remaining[0].deck);
+    if(ps.duoMode && remaining.length>=2)
+      chkQNotif(posId, remaining[1].deck);
   }
 }
 
 window.adminAddDeck = async function(posId){
   const inp = document.getElementById('add-deck-'+posId);
-  const val = inp?.value.trim();
-  if(!val){ showNotif('Enter deck number','warning'); return; }
+  const val = (inp?.value||'').trim();
+  if(!val||val==='undefined'){ showNotif('Enter deck number','warning'); return; }
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
   const num = (ps.nextNum||0)+1;
   await fbUpdate('state/pos_'+posId, {nextNum:num});
   await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:val,status:q.length===0?'playing':'waiting',method:'manual'});
+  if(ps.duoMode) await autoPair(posId);
   if(inp) inp.value='';
   showNotif('Deck '+val+' added','success');
 };
@@ -333,6 +436,100 @@ window.adminRm = async function(posId, num){
 window.adminCall  = async (posId,num) => fbUpdate('state/pos_'+posId+'/queue/'+num, {status:'called'});
 window.adminSkip  = async (posId,num) => fbUpdate('state/pos_'+posId+'/queue/'+num, {status:'waiting'});
 window.changeDur  = async (posId,d) => { const ps=getPosState(posId); await fbUpdate('state/pos_'+posId, {duration:Math.max(1,(ps.duration||8)+d)}); };
+window.toggleDuo = async (posId) => {
+  const ps = getPosState(posId);
+  const newMode = !(ps.duoMode||false);
+  await fbUpdate('state/pos_'+posId, {duoMode:newMode});
+  if(newMode) await autoPair(posId); // auto-pair existing queue when turned on
+  else await clearAllPairs(posId);   // clear pairs when turned off
+  showNotif('Duo mode '+(newMode?'ON':'OFF')+' — '+POS_DEFS[posId-1].name, newMode?'success':'warning');
+};
+
+async function autoPair(posId){
+  // Re-read fresh state to get latest queue
+  const fresh = await fbGet('state/pos_'+posId);
+  if(!fresh||!fresh.duoMode) return;
+  const q = Object.values(fresh.queue||{}).sort((a,b)=>(a.sortKey||a.num)-(b.sortKey||b.num));
+  // Only pair waiting/not-yet-playing decks (skip active session)
+  const waitingQ = q.filter(i=>i.status!=='playing'||(fresh.activeDuo&&q.indexOf(i)<2));
+  // Actually pair all — pair by consecutive index
+  const updates = {};
+  // Skip items that are currently playing in an active session
+  const skip = fresh.activeDuo ? 2 : (q[0]&&q[0].status==='playing' ? 1 : 0);
+  const toPair = q.slice(skip); // only pair waiting items
+  
+  // Also keep existing pairings for active players unchanged
+  for(let i=0; i<toPair.length-1; i+=2){
+    const a = toPair[i], b = toPair[i+1];
+    if(a && b){
+      updates['state/pos_'+posId+'/queue/'+a.num+'/pairedWith'] = b.deck;
+      updates['state/pos_'+posId+'/queue/'+b.num+'/pairedWith'] = a.deck;
+    } else if(a) {
+      updates['state/pos_'+posId+'/queue/'+a.num+'/pairedWith'] = null;
+    }
+  }
+  // If odd number at the end, last one has no pair
+  if(toPair.length%2 !== 0){
+    const last = toPair[toPair.length-1];
+    if(last) updates['state/pos_'+posId+'/queue/'+last.num+'/pairedWith'] = null;
+  }
+  if(Object.keys(updates).length) await update(ref(db), updates);
+  // Notify newly paired decks
+  for(let i=0; i<q.length-1; i+=2){
+    const a=q[i],b=q[i+1];
+    if(a&&b&&a.pairedWith!==b.deck){
+      // New pairing — send notification
+      await fbSet('notifications/pair_'+posId+'_'+a.num, {
+        type:'paired', deck1:a.deck, deck2:b.deck, posId, ts:Date.now()
+      });
+    }
+  }
+}
+
+async function clearAllPairs(posId){
+  const fresh = await fbGet('state/pos_'+posId);
+  if(!fresh||!fresh.queue) return;
+  const updates = {};
+  Object.values(fresh.queue).forEach(item=>{
+    updates['state/pos_'+posId+'/queue/'+item.num+'/pairedWith'] = null;
+  });
+  if(Object.keys(updates).length) await update(ref(db), updates);
+}
+
+window.cancelPair = async (posId) => {
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  if(q.length<2) return;
+  await fbUpdate('state/pos_'+posId+'/queue/'+q[1].num, {status:'waiting'});
+  await fbUpdate('state/pos_'+posId, {activeDuo:false});
+  showNotif('Pair cancelled — Deck '+q[1].deck+' moved back to waiting','warning');
+};
+
+// Manual pair: admin selects 2 specific decks to pair together (overrides auto)
+let _manualPairSelection = {}; // {posId: [num1, num2]}
+window.togglePairSelect = function(posId, num, deck){
+  if(!_manualPairSelection[posId]) _manualPairSelection[posId]=[];
+  const sel = _manualPairSelection[posId];
+  const idx = sel.findIndex(s=>s.num===num);
+  if(idx>=0){ sel.splice(idx,1); } // deselect
+  else if(sel.length<2){ sel.push({num,deck}); } // select (max 2)
+  else { showNotif('Select only 2 decks to pair','warning'); return; }
+  renderAdminContent(); // refresh to show tick state
+};
+window.confirmManualPair = async (posId) => {
+  const sel = _manualPairSelection[posId]||[];
+  if(sel.length!==2){ showNotif('Select exactly 2 decks first','warning'); return; }
+  const [a,b] = sel;
+  // Update pairedWith for both
+  await fbUpdate('state/pos_'+posId+'/queue/'+a.num, {pairedWith:b.deck});
+  await fbUpdate('state/pos_'+posId+'/queue/'+b.num, {pairedWith:a.deck});
+  // Notify both decks
+  await fbSet('notifications/pair_'+posId+'_'+a.num, {
+    type:'paired', deck1:a.deck, deck2:b.deck, posId, ts:Date.now()
+  });
+  _manualPairSelection[posId]=[];
+  showNotif('Deck '+(a.deck||'?')+' & Deck '+(b.deck||'?')+' paired!','success');
+};
 
 // ── NOTIFICATIONS ──
 function chkNotif(posId, rem, total){
@@ -347,7 +544,70 @@ function chkNotif(posId, rem, total){
 function chkQNotif(posId, deck){
   if(navDeck && navDeck===deck) showNotif('🎮 Your turn at '+POS_DEFS[posId-1].name+'!','urgent');
 }
+window.notifyPair = async function(posId){
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  if(q.length<2||!q[0]||!q[1]) { showNotif('Need at least 2 groups to pair','warning'); return; }
+  // Write pair notification to Firebase so navigators get it
+  const pairKey = Date.now();
+  await fbSet('notifications/'+posId, {
+    type:'pair', deck1:q[0].deck, deck2:q[1].deck, posId, ts:pairKey
+  });
+  showNotif('Pair notified — Deck '+q[0].deck+' & Deck '+q[1].deck+' at '+POS_DEFS[posId-1].name,'success');
+};
+window.notifyStandby = async function(posId){
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  // If duo active, notify the NEXT pair (q[2] & q[3]), otherwise notify q[0] & q[1] if duo mode
+  let nextDecks;
+  if(ps.activeDuo){ nextDecks = ps.duoMode&&q.length>=4 ? q.slice(2,4) : q.length>=3 ? q.slice(2,3) : []; }
+  else { nextDecks = ps.duoMode&&q.length>=2 ? q.slice(0,2) : q.slice(0,1); }
+  if(!nextDecks.length){ showNotif('No next group to notify','warning'); return; }
+  await fbSet('notifications/'+posId, {
+    type:'standby', decks:nextDecks.map(d=>d.deck), posId, ts:Date.now()
+  });
+  showNotif('Standby alert sent to '+nextDecks.map(d=>'Deck '+d.deck).join(' & '),'success');
+};
+function playNotifSound(type){
+  try {
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    if(type==='urgent'){
+      // 3 sharp beeps
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      osc.frequency.setValueAtTime(1100, ctx.currentTime+0.1);
+      osc.frequency.setValueAtTime(880, ctx.currentTime+0.2);
+      gain.gain.setValueAtTime(0.3, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+0.4);
+      osc.start(ctx.currentTime); osc.stop(ctx.currentTime+0.4);
+    } else if(type==='warning'){
+      // 2 medium beeps
+      osc.frequency.setValueAtTime(660, ctx.currentTime);
+      osc.frequency.setValueAtTime(880, ctx.currentTime+0.15);
+      gain.gain.setValueAtTime(0.2, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+0.35);
+      osc.start(ctx.currentTime); osc.stop(ctx.currentTime+0.35);
+    } else {
+      // 1 soft chime
+      osc.frequency.setValueAtTime(523, ctx.currentTime);
+      osc.frequency.setValueAtTime(659, ctx.currentTime+0.1);
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+0.3);
+      osc.start(ctx.currentTime); osc.stop(ctx.currentTime+0.3);
+    }
+  } catch(e){}
+}
+function vibrateNotif(type){
+  if(!navigator.vibrate) return;
+  if(type==='urgent') navigator.vibrate([200,80,200,80,200]);
+  else if(type==='warning') navigator.vibrate([150,60,150]);
+  else navigator.vibrate(100);
+}
 function showNotif(msg, type='success'){
+  playNotifSound(type);
+  vibrateNotif(type);
   const panel = document.getElementById('notif-panel');
   const div = document.createElement('div');
   div.className = 'notif'+(type==='warning'?' warning':type==='urgent'?' urgent':'');
@@ -383,6 +643,16 @@ function renderFairnessBar(){
       <span style="color:var(--amber)">■ Active (${active.length})</span>
       <span>■ Pending (${TOTAL_POS-passed-failed-active.length})</span>
     </div></div>`;
+  // Show blue dot on My Tickets tab if any deck is paired but not yet playing
+  const hasPair = POS_DEFS.some(def => {
+    const ps = getPosState(def.id);
+    const q = toArr(ps.queue);
+    const item = q.find(i=>i.deck===navDeck);
+    return item && item.pairedWith && item.status!=='playing';
+  });
+  const dot = document.getElementById('tickets-dot');
+  if(dot) dot.style.display = hasPair ? 'inline-block' : 'none';
+
   if(!lb) return;
   if(passed===TOTAL_POS){ lb.innerHTML=`<div class="banner-success"><i class="ti ti-trophy" style="font-size:18px"></i> All 5 missions PASSED! Outstanding, Deck ${navDeck}.</div>`; }
   else if(active.length>=MAX_ACTIVE){ lb.innerHTML=`<div class="banner-warn"><i class="ti ti-lock" style="font-size:18px;flex-shrink:0"></i><span>Slot limit reached (${active.length}/${MAX_ACTIVE}). Finish or cancel one first.</span></div>`; }
@@ -479,7 +749,8 @@ function renderTix(){
       ? mkTag('x','#ff4444','rgba(255,68,68,.1)','rgba(255,68,68,.3)','Failed'+(resTs?' · '+fmtTs(resTs):''))
       : '';
     const cancelBtn = inQueue?`<button onclick="cancelReservation(${def.id})" style="margin-left:auto;padding:4px 10px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:transparent;color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Cancel</button>`:'';
-    const st = myIdx===0?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active</span>':myIdx===1?'<span class="badge badge-amber">You\'re next</span>':myIdx>1?`<span class="badge badge-gray">${ahead} ahead</span>`:'';
+    const duoPartner = (ps.activeDuo&&myIdx===0&&q.length>=2&&q[1]&&q[1].deck&&q[1].deck!==navDeck)?q[1].deck:(ps.activeDuo&&myIdx===1&&q.length>=1&&q[0]&&q[0].deck&&q[0].deck!==navDeck)?q[0].deck:null;
+    const st = myIdx===0?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active'+(duoPartner?' 🤝 w/ DECK '+duoPartner:'')+'</span>':myIdx===1&&ps.duoMode?'<span class="badge badge-blue"><i class="ti ti-users"></i> Duo pair — get ready</span>':myIdx===1?'<span class="badge badge-amber">You\'re next</span>':myIdx>1?`<span class="badge badge-gray">${ahead} ahead</span>`:'';
     const remSecs = inQueue&&myIdx===0&&ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
     const total = dur*60;
     const countdown = remSecs!==null?`<div class="ticket-countdown">
@@ -494,6 +765,18 @@ function renderTix(){
         <div class="ticket-main-name">${def.name}</div>
         <div class="ticket-mission">&gt; ${def.mission}</div>
         <div class="ticket-deck-small">DECK ${navDeck}</div>
+        ${isDuoActive&&duoPartner?
+          `<div style="background:rgba(0,170,255,.12);border:1px solid rgba(0,170,255,.4);border-radius:4px;padding:10px 14px;margin:10px 0 4px;text-align:center">
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:4px">DUO SESSION — PLAYING WITH</div>
+            <div style="font-family:var(--font-mono);font-size:22px;font-weight:600;color:var(--blue);letter-spacing:3px">DECK ${duoPartner}</div>
+          </div>`
+        :(item.pairedWith&&item.pairedWith!=='null'&&!isDuoActive)?
+          `<div style="background:rgba(0,170,255,.08);border:1px solid rgba(0,170,255,.3);border-radius:4px;padding:10px 14px;margin:10px 0 4px;text-align:center;animation:pairPulse 2s infinite">
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:4px">🤝 PAIRED — WILL PLAY WITH</div>
+            <div style="font-family:var(--font-mono);font-size:22px;font-weight:600;color:var(--blue);letter-spacing:3px">DECK ${item.pairedWith}</div>
+            <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-top:4px">Get ready — your sessions will run together</div>
+          </div>`
+        :''}
         <div class="ticket-stats">
           <div><div class="tstat-val">${!inQueue?'✓':ahead===0?'—':ahead*dur+'m'}</div><div class="tstat-lbl">${!inQueue?'Done':'Est. Wait'}</div></div>
           <div><div class="tstat-val">${!inQueue?'✓':ahead}</div><div class="tstat-lbl">Ahead</div></div>
@@ -501,7 +784,7 @@ function renderTix(){
         </div>${countdown}
       </div>
       <div style="padding:8px 1.25rem;display:flex;align-items:center;gap:6px;flex-wrap:wrap;border-top:1px solid var(--border2)">
-        ${st}${resBadge} ${mBadge}${cancelBtn}
+        ${st}${resBadge}${pairBadge} ${mBadge}${cancelBtn}
       </div></div>`;
   }).join('');
 }
@@ -527,7 +810,11 @@ function renderNavStatus(){
       <div style="flex:1">
         <div style="font-size:13px;font-weight:700;color:var(--text)">${def.name}</div>
         <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">&gt; ${def.mission}</div>
-        ${myItem?`<div style="margin-top:4px"><span class="badge badge-green" style="font-size:10px">Queue #${String(myItem.num).padStart(2,'0')}</span> ${myStatus}</div>`:''}
+        ${myItem?`<div style="margin-top:4px">
+          <span class="badge badge-green" style="font-size:10px">Queue #${String(myItem.num).padStart(2,'0')}</span> ${myStatus}
+          ${ps.activeDuo&&(myIdx===0||myIdx===1)?`<span class="badge badge-blue" style="font-size:9px"><i class="ti ti-users"></i> Duo w/ DECK ${myIdx===0&&q[1]&&q[1].deck?q[1].deck:myIdx===1&&q[0]&&q[0].deck?q[0].deck:''}</span>`:''}
+          ${!ps.activeDuo&&ps.duoMode?`<span class="badge badge-blue" style="font-size:9px"><i class="ti ti-users"></i> Duo</span>`:''}
+        </div>`:''}
         ${res?`<div style="margin-top:4px">${mkTag(res==='passed'?'check':'x',res==='passed'?'#7aaa88':'#ff4444',res==='passed'?'rgba(0,255,136,.05)':'rgba(255,68,68,.1)',res==='passed'?'rgba(0,255,136,.15)':'rgba(255,68,68,.3)',res==='passed'?'Passed':'Failed')}</div>`:''}
         ${timerHtml}
       </div>
@@ -569,13 +856,32 @@ function renderAdminContent(){
       timerBlock=`<div class="card" style="margin-bottom:10px;border-color:rgba(0,255,136,.3)">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
           <span style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">ACTIVE SLOT TIMER</span>
-          <span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--green)">DECK ${first.deck}</span>
+          <span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--green)">DECK ${first.deck||"?"}</span>
         </div>
         <div id="timer-${adminPosId}" class="timer-display${rem<=30?' danger':rem<=total*.3?' warning':''}">${fmt(rem)}</div>
         <div class="timer-bar"><div id="timerbar-${adminPosId}" class="timer-fill${rem<=30?' tf-red':rem<=total*.3?' tf-amber':' tf-green'}" style="width:${Math.round((rem/total)*100)}%"></div></div>
         <div style="margin-top:10px;display:flex;gap:6px">
-          <button onclick="adminEndSession(${adminPosId},'passed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
-          <button onclick="adminEndSession(${adminPosId},'failed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
+          ${ps.activeDuo&&q.length>=2&&q[1].status==='playing' ? `
+            <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-bottom:6px;letter-spacing:1px">SET RESULT PER DECK</div>
+            <div style="background:var(--bg2);border-radius:4px;padding:8px;margin-bottom:5px">
+              <div style="font-family:var(--font-mono);font-size:11px;color:var(--text);margin-bottom:5px">DECK ${q[0].deck}</div>
+              <div style="display:flex;gap:4px">
+                <button onclick="adminEndSession(${adminPosId},'passed','${q[0].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
+                <button onclick="adminEndSession(${adminPosId},'failed','${q[0].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
+              </div>
+            </div>
+            <div style="background:var(--bg2);border-radius:4px;padding:8px;margin-bottom:5px">
+              <div style="font-family:var(--font-mono);font-size:11px;color:var(--text);margin-bottom:5px">DECK ${q[1].deck}</div>
+              <div style="display:flex;gap:4px">
+                <button onclick="adminEndSession(${adminPosId},'passed','${q[1].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
+                <button onclick="adminEndSession(${adminPosId},'failed','${q[1].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
+              </div>
+            </div>
+            <button onclick="cancelPair(${adminPosId})" style="width:100%;padding:7px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:transparent;color:var(--amber);border:1px solid rgba(255,184,0,.4)"><i class="ti ti-unlink"></i> Cancel Pair</button>
+          ` : `
+            <button onclick="adminEndSession(${adminPosId},'passed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
+            <button onclick="adminEndSession(${adminPosId},'failed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
+          `}
         </div></div>`;
     } else {
       timerBlock=`<div class="card" style="margin-bottom:10px;border-style:dashed">
@@ -584,20 +890,47 @@ function renderAdminContent(){
           <span style="font-size:13px;font-weight:700;color:var(--text)">DECK ${first.deck}</span>
           <span style="font-family:var(--font-mono);font-size:11px;color:var(--text3)">${dur}m session</span>
         </div>
-        <button class="btn btn-primary" onclick="startTimer(${adminPosId})"><i class="ti ti-player-play"></i> Start Session</button></div>`;
+        <div style="display:flex;gap:6px;margin-bottom:8px">
+          <button class="btn btn-sm" style="flex:1;justify-content:center" onclick="notifyStandby(${adminPosId})"><i class="ti ti-bell"></i> Notify Standby</button>
+          ${ps.duoMode&&q.length>=2?`<button class="btn btn-sm btn-blue" style="flex:1;justify-content:center" onclick="notifyPair(${adminPosId})"><i class="ti ti-users"></i> Notify Pair</button>`:''}
+        </div>
+        <button class="btn btn-primary" onclick="startTimer(${adminPosId})"><i class="ti ti-player-play"></i> ${ps.duoMode&&q.length>=2?'Start Duo Session':'Start Session'}</button>
+        ${ps.duoMode&&q.length>=2?`<button class="btn btn-sm" style="margin-top:6px;width:100%;justify-content:center;color:var(--text3)" onclick="startTimerSolo(${adminPosId})"><i class="ti ti-user"></i> Play Solo (skip pair)</button>`:''}
+        </div>`;
     }
   }
 
-  const waiting = q.slice(1);
+  // In duo session, q[1] is also playing — exclude from waiting list
+  const waiting = ps.activeDuo&&q.length>=2&&q[1].status==='playing' ? q.slice(2) : q.slice(1);
+  const selForPair = (_manualPairSelection[adminPosId]||[]);
+  const pairBtnHtml = ps.duoMode&&selForPair.length===2
+    ? `<button class="btn btn-blue btn-sm" style="width:100%;justify-content:center;margin-bottom:8px" onclick="confirmManualPair(${adminPosId})"><i class="ti ti-users"></i> Pair: DECK ${selForPair[0].deck} + DECK ${selForPair[1].deck}</button>`
+    : ps.duoMode&&selForPair.length===1
+    ? `<div style="font-family:var(--font-mono);font-size:10px;color:var(--blue);margin-bottom:6px"><i class="ti ti-check"></i> DECK ${selForPair[0].deck} selected — pick one more to pair</div>`
+    : '';
   const waitHtml = waiting.length?
-    `<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:6px">QUEUE (${waiting.length})</div>`+
+    pairBtnHtml+`<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:6px">QUEUE (${waiting.length})</div>`+
     waiting.map((item,i)=>{
       const mIcon=item.method==='scan'?'ti-scan':item.method==='manual'?'ti-pencil':'ti-device-mobile';
       const badge=item.status==='called'?'<span class="badge badge-amber">Called</span>':'<span class="badge badge-gray">Waiting</span>';
-      return `<div class="q-item${item.status==='called'?' called':''}">
+      // i=0 is position 2 in full queue (waiting[0]), i=1 is position 3, etc.
+      const realPos = i+2; // position in overall queue (1-based)
+      // Allow manual pair reorder anytime duoMode is on — even while timer running
+      // i>0 means this is position 3+ in the waiting list (position 2+ in full queue)
+      // If activeDuo: waiting[0] is already position 3 — can pair waiting[1]+ up
+      const canPairManually = ps.duoMode && i>0;
+      const isSelected = (_manualPairSelection[adminPosId]||[]).some(s=>s.num===item.num);
+      const partnerDeck = (item.pairedWith&&item.pairedWith!=='null'&&item.pairedWith!=='undefined') ? item.pairedWith : null;
+      return `<div class="q-item${item.status==='called'?' called':''}" style="${isSelected?'border-color:var(--blue);background:rgba(0,170,255,.08)':''}">
+        ${ps.duoMode&&item.deck?`<div onclick="togglePairSelect(${adminPosId},${item.num},'${item.deck}')" style="width:20px;height:20px;border-radius:3px;border:1px solid ${isSelected?'var(--blue)':'var(--border2)'};background:${isSelected?'var(--blue)':'transparent'};display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;color:white;font-size:12px;margin-right:2px">${isSelected?'✓':''}</div>`:''}
         <div class="qnum">${item.num}</div>
-        <div class="qi-info"><div class="qi-name">DECK ${item.deck}</div>
-          <div class="qi-sub">${badge} <i class="ti ${mIcon}" style="font-size:11px;opacity:.5"></i></div></div>
+        <div class="qi-info">
+          <div class="qi-name">DECK ${item.deck||'?'}</div>
+          <div class="qi-sub">
+            ${badge} <i class="ti ${mIcon}" style="font-size:11px;opacity:.5"></i>
+            ${partnerDeck?`<span style="font-size:9px;padding:1px 6px;border-radius:2px;background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3)"><i class="ti ti-users"></i> w/ DECK ${partnerDeck}</span>`:''}
+          </div>
+        </div>
         <div style="display:flex;gap:4px">
           ${i===0?`<button class="btn btn-sm btn-amber" onclick="adminCall(${adminPosId},${item.num})">Call</button>`:`<button class="btn btn-sm" onclick="adminSkip(${adminPosId},${item.num})" style="color:var(--text3)">Skip</button>`}
           <button class="btn btn-sm btn-red" onclick="adminRm(${adminPosId},${item.num})"><i class="ti ti-trash"></i></button>
@@ -615,6 +948,13 @@ function renderAdminContent(){
         <button class="dur-btn" onclick="changeDur(${adminPosId},-1)">−</button>
         <span style="font-family:var(--font-mono);font-size:12px;min-width:40px;text-align:center;color:var(--text)">${dur}m</span>
         <button class="dur-btn" onclick="changeDur(${adminPosId},1)">+</button>
+      </div>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
+        <span style="font-size:10px;color:var(--text3)">DUO</span>
+        <button onclick="toggleDuo(${adminPosId})" style="width:44px;height:24px;border-radius:12px;border:1px solid ${ps.duoMode?'var(--green)':'var(--border2)'};background:${ps.duoMode?'var(--green-dark)':'var(--bg3)'};cursor:pointer;position:relative;transition:all .2s">
+          <div style="width:18px;height:18px;border-radius:50%;background:${ps.duoMode?'var(--green)':'var(--text3)'};position:absolute;top:2px;${ps.duoMode?'right:2px':'left:2px'};transition:all .2s"></div>
+        </button>
+        <span style="font-family:var(--font-mono);font-size:10px;color:${ps.duoMode?'var(--green)':'var(--text3)'}">${ps.duoMode?'ON':'OFF'}</span>
       </div>
     </div>
     <div class="add-deck-row"><input id="add-deck-${adminPosId}" placeholder="Deck number" maxlength="6" onkeydown="if(event.key==='Enter') adminAddDeck(${adminPosId})"/><button class="btn btn-blue btn-sm" onclick="adminAddDeck(${adminPosId})"><i class="ti ti-plus"></i> Add</button></div>
@@ -812,6 +1152,7 @@ window.doReset = async function(){
     });
     updates['results']=null;
     updates['presence']=null;
+    updates['notifications']=null;
     await update(ref(db), updates);
     hideLoading(); closeReset();
     showNotif('All data has been reset','success');
@@ -954,6 +1295,7 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
 .banner-success{background:rgba(0,255,136,.08);border:1px solid rgba(0,255,136,.3);border-radius:4px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--green);font-weight:600}
 .banner-warn{background:rgba(255,184,0,.08);border:1px solid rgba(255,184,0,.3);border-radius:4px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--amber);font-weight:600}
 @keyframes slotPulse{0%,100%{opacity:1}50%{opacity:.5}}
+@keyframes pairPulse{0%,100%{box-shadow:0 0 0 0 rgba(0,170,255,0)}50%{box-shadow:0 0 8px 2px rgba(0,170,255,.25)}}
 </style>
 </head>
 <body>
@@ -1021,7 +1363,7 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
   </div>
   <div class="tab-bar">
     <button class="tab active" onclick="navTab('reserve',this)"><i class="ti ti-plus-circle"></i> Reserve</button>
-    <button class="tab" onclick="navTab('tickets',this)"><i class="ti ti-ticket"></i> My Tickets</button>
+    <button class="tab" onclick="navTab('tickets',this)"><i class="ti ti-ticket"></i> My Tickets <span id="tickets-dot" style="width:7px;height:7px;border-radius:50%;background:var(--blue);margin-left:2px;vertical-align:middle;animation:pulse 2s infinite"></span></button>
     <button class="tab" onclick="navTab('status',this)"><i class="ti ti-activity"></i> Live Status</button>
   </div>
   <div id="nav-view-reserve" class="view active">
