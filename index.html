@@ -778,7 +778,7 @@ function renderTix(){
       <div id="nav-timer-${def.id}" class="timer-display${remSecs<=30?' danger':remSecs<=total*.3?' warning':''}">${fmt(remSecs)}</div>
       <div class="timer-bar"><div id="nav-timerbar-${def.id}" class="timer-fill${remSecs<=30?' tf-red':remSecs<=total*.3?' tf-amber':' tf-green'}" style="width:${Math.round((remSecs/total)*100)}%"></div></div>
     </div>`:'';
-    const mBadge = item?.method==='scan'?'<span class="badge badge-green" style="font-size:10px"><i class="ti ti-scan"></i> Scan</span>':item?.method==='manual'?'<span class="badge badge-gray" style="font-size:10px"><i class="ti ti-pencil"></i> Admin</span>':'<span class="badge badge-blue" style="font-size:10px"><i class="ti ti-device-mobile"></i> App</span>';
+
     return `<div class="card" style="padding:0;overflow:hidden;margin-bottom:12px;${!inQueue?'opacity:.7':''}">
       <div class="ticket ${TCOL[def.id-1]}" style="border:none;border-radius:0">
         <div class="ticket-station-id"><i class="ti ${def.icon}"></i> STATION ${def.id}</div>
@@ -804,7 +804,7 @@ function renderTix(){
         </div>${countdown}
       </div>
       <div style="padding:8px 1.25rem;display:flex;align-items:center;gap:6px;flex-wrap:wrap;border-top:1px solid var(--border2)">
-        ${st}${resBadge}${pairBadge} ${mBadge}${cancelBtn}
+        ${st}${resBadge}${pairBadge} ${cancelBtn}
       </div></div>`;
   }).join('');
 }
@@ -820,10 +820,10 @@ function renderNavStatus(){
     const res = getResultSync(navDeck, def.id);
     const remSecs = ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
     const timerHtml = remSecs!==null?`<div style="margin-top:6px">
-      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:1px;margin-bottom:2px">CURRENT SLOT</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:1px;margin-bottom:2px">${q.filter(i=>['playing','expired'].includes(i.status)).map(i=>'DECK '+i.deck).join(' + ')||'NOW PLAYING'}</div>
       <div id="st-timer-${def.id}" class="timer-display${remSecs<=30?' danger':remSecs<=dur*60*.3?' warning':''}" style="font-size:14px">${fmt(remSecs)}</div>
       <div class="timer-bar" style="margin-top:4px"><div id="st-bar-${def.id}" class="timer-fill ${remSecs<=30?'tf-red':remSecs<=dur*60*.3?'tf-amber':'tf-green'}" style="width:${Math.round((remSecs/(dur*60))*100)}%"></div></div>
-    </div>`:len>0&&!ps.timerRunning?`<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:4px">Waiting for admin</div>`:'';
+    </div>`:len>0&&!ps.timerRunning?`<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:4px">Waiting for admin to start</div>`:'';
     const activeStatusesNav = ['playing','expired'];
         const playingCntNav = q.filter(i=>activeStatusesNav.includes(i.status)).length;
         const waitIdxNav = myIdx>=0 ? Math.max(0, myIdx-playingCntNav) : 0;
@@ -835,7 +835,7 @@ function renderNavStatus(){
         <div style="font-size:13px;font-weight:700;color:var(--text)">${def.name}</div>
         <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">&gt; ${def.mission}</div>
         ${myItem?`<div style="margin-top:4px">
-          <span class="badge badge-green" style="font-size:10px">Queue #${String(myItem.num).padStart(2,'0')}</span> ${myStatus}
+          ${myStatus}
           ${ps.activeDuo&&(myIdx===0||myIdx===1)?`<span class="badge badge-blue" style="font-size:9px"><i class="ti ti-users"></i> Duo w/ DECK ${myIdx===0&&q[1]&&q[1].deck?q[1].deck:myIdx===1&&q[0]&&q[0].deck?q[0].deck:''}</span>`:''}
           ${!ps.activeDuo&&ps.duoMode?`<span class="badge badge-blue" style="font-size:9px"><i class="ti ti-users"></i> Duo</span>`:''}
         </div>`:''}
