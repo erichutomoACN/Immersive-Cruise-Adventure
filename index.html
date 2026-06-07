@@ -192,7 +192,7 @@ window.selectAdminPos = async function(posId){
 window.navDeckConfirm = async function(){
   const val = document.getElementById('nav-deck-input').value.trim();
   if(!val){ showNotif('Enter your deck number','warning'); return; }
-  navDeck = val;
+  navDeck = String(val);
   showLoading('Loading...');
   try { fbState = (await fbGet('state')) || {}; } catch(e){}
   hideLoading();
@@ -225,11 +225,11 @@ window.navDeckConfirm = async function(){
       if(lastNotifTs[key]) return;
       lastNotifTs[key] = true;
       const posName = POS_DEFS[n.posId-1].name;
-      if((n.type==='pair'||n.type==='paired') && (n.deck1===navDeck||n.deck2===navDeck)){
+      if((n.type==='pair'||n.type==='paired') && (String(n.deck1)===String(navDeck)||String(n.deck2)===String(navDeck))){
         const partner = n.deck1===navDeck ? n.deck2 : n.deck1;
         showNotif('🤝 You will play with DECK '+partner+' at '+posName+'!','success');
       }
-      if(n.type==='standby' && n.decks && n.decks.includes(navDeck)){
+      if(n.type==='standby' && n.decks && n.decks.map(String).includes(String(navDeck))){
         showNotif('⚡ Get ready! Head to '+posName+' — your turn is coming up!','warning');
       }
     });
@@ -248,11 +248,11 @@ window.navDeckConfirm = async function(){
       if(lastNotifTs[key]) return; // already shown
       lastNotifTs[key] = true;
       const posName = POS_DEFS[n.posId-1].name;
-      if((n.type==='pair'||n.type==='paired') && (n.deck1===navDeck||n.deck2===navDeck)){
+      if((n.type==='pair'||n.type==='paired') && (String(n.deck1)===String(navDeck)||String(n.deck2)===String(navDeck))){
         const partner = n.deck1===navDeck ? n.deck2 : n.deck1;
         showNotif('🤝 You will play with DECK '+partner+' at '+posName+'!','success');
       }
-      if(n.type==='standby' && n.decks && n.decks.includes(navDeck)){
+      if(n.type==='standby' && n.decks && n.decks.map(String).includes(String(navDeck))){
         showNotif('⚡ Get ready! Head to '+posName+' — your turn is coming up!','warning');
       }
     });
@@ -292,10 +292,10 @@ const fmtTs = ts => {
 // ── FAIRNESS (reads from Firebase state) ──
 function getActiveDeckPos(){
   // Returns list of posIds where navDeck is currently in queue
-  return POS_DEFS.map(def => def.id).filter(id => toArr(getPosState(id).queue).some(i=>i.deck===navDeck));
+  return POS_DEFS.map(def => def.id).filter(id => toArr(getPosState(id).queue).some(i=>String(i.deck)===String(navDeck)));
 }
 function canReserve(posId){
-  const inQueue = toArr(getPosState(posId).queue).some(i=>i.deck===navDeck);
+  const inQueue = toArr(getPosState(posId).queue).some(i=>String(i.deck)===String(navDeck));
   const res = getResultSync(navDeck, posId);
   if(res==='passed') return {ok:false,reason:'passed'};
   if(inQueue) return {ok:false,reason:'already'};
@@ -325,7 +325,7 @@ window.navConfirmRegister = async function(posId){
 window.cancelReservation = async function(posId){
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
-  const item = q.find(i=>i.deck===navDeck);
+  const item = q.find(i=>String(i.deck)===String(navDeck));
   if(!item) return;
   await fbDel('state/pos_'+posId+'/queue/'+item.num);
   if(item.status==='playing'){
@@ -477,7 +477,7 @@ async function autoPair(posId){
   // Notify newly paired decks
   for(let i=0; i<q.length-1; i+=2){
     const a=q[i],b=q[i+1];
-    if(a&&b&&a.pairedWith!==b.deck){
+    if(a&&b&&String(a.pairedWith)!==String(b.deck)){
       // New pairing — send notification
       await fbSet('notifications/pair_'+posId+'_'+a.num, {
         type:'paired', deck1:a.deck, deck2:b.deck, posId, ts:Date.now()
@@ -535,14 +535,14 @@ window.confirmManualPair = async (posId) => {
 function chkNotif(posId, rem, total){
   if(!navDeck) return;
   const q = toArr(getPosState(posId).queue);
-  const idx = q.findIndex(i=>i.deck===navDeck);
+  const idx = q.findIndex(i=>String(i.deck)===String(navDeck));
   if(idx!==1) return;
   const key = posId+'_'+(q[1]?.num||'');
   if(rem<=60&&rem>55&&!notifiedFlags[key+'_60']){ notifiedFlags[key+'_60']=true; showNotif('⚡ Get ready! '+POS_DEFS[posId-1].name+' in ~1 min','warning'); }
   if(rem<=15&&rem>10&&!notifiedFlags[key+'_15']){ notifiedFlags[key+'_15']=true; showNotif('🚨 MOVE NOW — '+POS_DEFS[posId-1].name+' — your turn is NEXT!','urgent'); }
 }
 function chkQNotif(posId, deck){
-  if(navDeck && navDeck===deck) showNotif('🎮 Your turn at '+POS_DEFS[posId-1].name+'!','urgent');
+  if(navDeck && String(navDeck)===String(deck)) showNotif('🎮 Your turn at '+POS_DEFS[posId-1].name+'!','urgent');
 }
 window.notifyPair = async function(posId){
   const ps = getPosState(posId);
@@ -647,7 +647,7 @@ function renderFairnessBar(){
   const hasPair = POS_DEFS.some(def => {
     const ps = getPosState(def.id);
     const q = toArr(ps.queue);
-    const item = q.find(i=>i.deck===navDeck);
+    const item = q.find(i=>String(i.deck)===String(navDeck));
     return item && item.pairedWith && item.status!=='playing';
   });
   const dot = document.getElementById('tickets-dot');
@@ -730,7 +730,7 @@ function renderTix(){
   POS_DEFS.forEach(def => {
     const ps = getPosState(def.id);
     const q = toArr(ps.queue);
-    const item = q.find(i=>i.deck===navDeck);
+    const item = q.find(i=>String(i.deck)===String(navDeck));
     const res = getResultSync(navDeck, def.id);
     if(item) tickets.push({def, ps, item, q, res}); // only active queue entries
   });
@@ -795,7 +795,7 @@ function renderNavStatus(){
   el.innerHTML = POS_DEFS.map(def => {
     const ps = getPosState(def.id);
     const q = toArr(ps.queue), len=q.length, dur=ps.duration||8;
-    const myItem = q.find(i=>i.deck===navDeck);
+    const myItem = q.find(i=>String(i.deck)===String(navDeck));
     const myIdx = myItem ? q.findIndex(i=>i.num===myItem.num) : -1;
     const res = getResultSync(navDeck, def.id);
     const remSecs = ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
