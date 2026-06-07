@@ -333,15 +333,29 @@ window.cancelReservation = async function(posId){
 // ── ADMIN ACTIONS ──
 window.startTimer = async function(posId){
   const ps = getPosState(posId);
-  const q = toArr(ps.queue);
+  let q = toArr(ps.queue);
   if(!q.length||ps.timerRunning) return;
   const timerEnd = Date.now()+(ps.duration||8)*60000;
+
+  // If q[0] has a manual pair partner NOT at q[1], swap them first
+  if(ps.duoMode && q.length>=2 && q[0].pairedWith && q[0].pairedWith!=='null'){
+    const partnerIdx = q.findIndex((item,idx)=>idx>0&&String(item.deck)===String(q[0].pairedWith));
+    if(partnerIdx>1){
+      const curr=q[1], partner=q[partnerIdx];
+      await fbUpdate('state/pos_'+posId+'/queue/'+curr.num, {sortKey:partner.sortKey||partner.num});
+      await fbUpdate('state/pos_'+posId+'/queue/'+partner.num, {sortKey:curr.sortKey||curr.num});
+      await new Promise(r=>setTimeout(r,300));
+      const fresh = await fbGet('state/pos_'+posId);
+      q = Object.values(fresh.queue||{}).filter(i=>i&&i.deck&&i.num)
+          .sort((a,b)=>(a.sortKey||a.num)-(b.sortKey||b.num));
+    }
+  }
+
   const isDuo = ps.duoMode && q.length>=2;
   await fbUpdate('state/pos_'+posId, {timerRunning:true, timerEnd, activeDuo:isDuo});
   await fbUpdate('state/pos_'+posId+'/queue/'+q[0].num, {status:'playing'});
   if(isDuo) await fbUpdate('state/pos_'+posId+'/queue/'+q[1].num, {status:'playing'});
-  // Re-pair remaining waiting decks now that these are playing
-  await autoPair(posId); // re-pair remaining waiting decks
+  await autoPair(posId);
 };
 
 window.startTimerSolo = async function(posId){
@@ -465,16 +479,32 @@ async function autoPair(posId){
 
   if(waitingQ.length<1) return;
 
+  // Find manual pairs already set — pairs where both decks reference each other
+  const manualPairs = new Set();
+  waitingQ.forEach(a=>{
+    if(!a.pairedWith||a.pairedWith==='null') return;
+    const partner = waitingQ.find(b=>String(b.deck)===String(a.pairedWith));
+    if(partner && String(partner.pairedWith)===String(a.deck)){
+      // Valid mutual pair — preserve it
+      manualPairs.add(a.num);
+      manualPairs.add(partner.num);
+    }
+  });
+
+  // Separate manually paired and unpaired waiting decks
+  const manuallyPaired = waitingQ.filter(i=>manualPairs.has(i.num));
+  const unpaired = waitingQ.filter(i=>!manualPairs.has(i.num));
+
   const updates = {};
   const newPairs = [];
 
-  // Clear existing pairedWith on all waiting decks
-  waitingQ.forEach(i=>{
+  // Clear pairedWith only for unpaired decks
+  unpaired.forEach(i=>{
     updates['state/pos_'+posId+'/queue/'+i.num+'/pairedWith'] = null;
   });
 
-  // Pair consecutively
-  for(let i=0; i<waitingQ.length-1; i+=2){
+  // Auto-pair unpaired decks consecutively
+  for(let i=0; i<unpaired.length-1; i+=2){
     const a = waitingQ[i], b = waitingQ[i+1];
     if(a&&b){
       updates['state/pos_'+posId+'/queue/'+a.num+'/pairedWith'] = String(b.deck);
@@ -482,8 +512,8 @@ async function autoPair(posId){
       if(String(a.pairedWith)!==String(b.deck)) newPairs.push({a,b});
     }
   }
-  if(waitingQ.length%2!==0){
-    const last = waitingQ[waitingQ.length-1];
+  if(unpaired.length%2!==0){
+    const last = unpaired[unpaired.length-1];
     if(last) updates['state/pos_'+posId+'/queue/'+last.num+'/pairedWith'] = null;
   }
 
@@ -768,9 +798,9 @@ function renderTix(){
     const cancelBtn = inQueue?`<button onclick="cancelReservation(${def.id})" style="margin-left:auto;padding:4px 10px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:transparent;color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Cancel</button>`:'';
     const isDuoActive = !!(ps.activeDuo && myIdx>=0 && myIdx<=1 && q[myIdx]&&q[myIdx].status==='playing');
     const duoPartner = (ps.activeDuo&&myIdx===0&&q.length>=2&&q[1]&&q[1].deck&&String(q[1].deck)!==String(navDeck))?String(q[1].deck):(ps.activeDuo&&myIdx===1&&q.length>=1&&q[0]&&q[0].deck&&String(q[0].deck)!==String(navDeck))?String(q[0].deck):null;
-    const pairBadge = (item.pairedWith&&item.pairedWith!=='null'&&item.pairedWith!=='undefined'&&myIdx>=0) ? `<span class="badge" style="background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3);font-size:10px"><i class="ti ti-users"></i> Paired w/ DECK ${item.pairedWith}</span>` : '';
+    const pairBadge = (ps.duoMode&&item.pairedWith&&item.pairedWith!=='null'&&item.pairedWith!=='undefined'&&myIdx>=0) ? `<span class="badge" style="background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3);font-size:10px"><i class="ti ti-users"></i> Paired w/ DECK ${item.pairedWith}</span>` : '';
     const isPlaying = activeStatuses.includes(item.status);
-    const st = isPlaying?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active'+(duoPartner?' 🤝 w/ DECK '+duoPartner:'')+'</span>':waitingIdx===0&&ps.duoMode&&item.pairedWith&&item.pairedWith!=='null'?'<span class="badge badge-blue"><i class="ti ti-users"></i> Duo pair — get ready</span>':waitingIdx===0?'<span class="badge badge-amber">You\'re next</span>':waitingIdx>0?`<span class="badge badge-gray">${ahead} ahead</span>`:'';
+    const st = isPlaying&&ps.duoMode&&isDuoActive?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active 🤝 w/ DECK '+(duoPartner||'?')+'</span>':isPlaying?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active</span>':waitingIdx===0&&ps.duoMode&&item.pairedWith&&item.pairedWith!=='null'?'<span class="badge badge-blue"><i class="ti ti-users"></i> Duo pair — get ready</span>':waitingIdx===0?'<span class="badge badge-amber">You\'re next</span>':waitingIdx>0?`<span class="badge badge-gray">${ahead} ahead</span>`:'';
     const remSecs = inQueue&&myIdx===0&&ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
     const total = dur*60;
     const countdown = remSecs!==null?`<div class="ticket-countdown">
@@ -785,12 +815,12 @@ function renderTix(){
         <div class="ticket-main-name">${def.name}</div>
         <div class="ticket-mission">&gt; ${def.mission}</div>
         <div class="ticket-deck-small">DECK ${navDeck}</div>
-        ${isDuoActive&&duoPartner?
+        ${isDuoActive&&ps.duoMode&&duoPartner?
           `<div style="background:rgba(0,170,255,.12);border:1px solid rgba(0,170,255,.4);border-radius:4px;padding:10px 14px;margin:10px 0 4px;text-align:center">
             <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:4px">DUO SESSION — PLAYING WITH</div>
             <div style="font-family:var(--font-mono);font-size:22px;font-weight:600;color:var(--blue);letter-spacing:3px">DECK ${duoPartner}</div>
           </div>`
-        :(item.pairedWith&&item.pairedWith!=='null'&&!isDuoActive)?
+        :(ps.duoMode&&item.pairedWith&&item.pairedWith!=='null'&&!isDuoActive)?
           `<div style="background:rgba(0,170,255,.08);border:1px solid rgba(0,170,255,.3);border-radius:4px;padding:10px 14px;margin:10px 0 4px;text-align:center;animation:pairPulse 2s infinite">
             <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:4px">🤝 PAIRED — WILL PLAY WITH</div>
             <div style="font-family:var(--font-mono);font-size:22px;font-weight:600;color:var(--blue);letter-spacing:3px">DECK ${item.pairedWith}</div>
@@ -799,7 +829,7 @@ function renderTix(){
         :''}
         <div class="ticket-stats">
           <div><div class="tstat-val">${!inQueue?'✓':isPlaying?'—':ps.duoMode?Math.ceil(waitingIdx/2)*dur+'m':waitingIdx===0?'—':waitingIdx*dur+'m'}</div><div class="tstat-lbl">${!inQueue?'Done':'Est. Wait'}</div></div>
-          <div><div class="tstat-val">${!inQueue?'✓':isPlaying?'Together':ps.duoMode?Math.ceil((waitingIdx+1)/2):waitingIdx}</div><div class="tstat-lbl">${isPlaying?'Duo':ps.duoMode?'Pair Ahead':'Ahead'}</div></div>
+          <div><div class="tstat-val">${!inQueue?'✓':isPlaying&&ps.duoMode&&isDuoActive?'Together':isPlaying?'Active':ps.duoMode?Math.ceil((waitingIdx+1)/2):waitingIdx}</div><div class="tstat-lbl">${isPlaying&&ps.duoMode&&isDuoActive?'Duo':ps.duoMode?'Pair Ahead':'Ahead'}</div></div>
           <div><div class="tstat-val">${dur}m</div><div class="tstat-lbl">Play Time</div></div>
         </div>${countdown}
       </div>
@@ -876,6 +906,7 @@ function renderAdminContent(){
   let timerBlock='';
   if(q.length>0){
     const first=q[0];
+    const firstSelBox = ps.duoMode && first ? `<div onclick="togglePairSelect(${adminPosId},${first.num},'${first.deck||''}')" style="width:20px;height:20px;border-radius:3px;border:1px solid ${(_manualPairSelection[adminPosId]||[]).some(s=>s.num===first.num)?'var(--blue)':'var(--border2)'};background:${(_manualPairSelection[adminPosId]||[]).some(s=>s.num===first.num)?'var(--blue)':'transparent'};cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:white;font-size:12px;margin-right:6px;vertical-align:middle">${(_manualPairSelection[adminPosId]||[]).some(s=>s.num===first.num)?'✓':''}</div>` : '';
     const isExpired = q.length>0 && (q[0].status==='expired' || (ps.activeDuo&&q.length>=2&&q[1]&&q[1].status==='expired'));
   if(isExpired){
     timerBlock=`<div class="card" style="margin-bottom:10px;border-color:rgba(255,184,0,.4)">
@@ -940,7 +971,7 @@ function renderAdminContent(){
       timerBlock=`<div class="card" style="margin-bottom:10px;border-style:dashed">
         <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-bottom:8px">READY TO START</div>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-          <span style="font-size:13px;font-weight:700;color:var(--text)">DECK ${first.deck}</span>
+          <span style="font-size:13px;font-weight:700;color:var(--text)">${firstSelBox}DECK ${first.deck}</span>
           <span style="font-family:var(--font-mono);font-size:11px;color:var(--text3)">${dur}m session</span>
         </div>
         <div style="display:flex;gap:6px;margin-bottom:8px">
