@@ -1,0 +1,1095 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Immersive Cruise Adventure // Queue System</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, set, get, update, onValue, remove, push } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBWacJTCLJocafZDUgJbzwo5QRoPshyaoc",
+  authDomain: "fieldops-queue.firebaseapp.com",
+  databaseURL: "https://fieldops-queue-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "fieldops-queue",
+  storageBucket: "fieldops-queue.firebasestorage.app",
+  messagingSenderId: "861184179450",
+  appId: "1:861184179450:web:ab0275682738517cd75d43"
+};
+
+const fbApp = initializeApp(firebaseConfig);
+const db = getDatabase(fbApp);
+
+// ── CONSTANTS ──
+const ADMIN_PIN = '1234';
+const MAX_ACTIVE = 2;
+const TOTAL_POS = 5;
+const POS_DEFS = [
+  {id:1,name:"Terminal Circuit Recovery",mission:"Fixing the Corrupted Server",icon:"ti-cpu",topColor:"#00aaff",pnClass:"pn1"},
+  {id:2,name:"Emergency Power Grid",mission:"Stabilizing the Energy Tower",icon:"ti-bolt",topColor:"#ffb800",pnClass:"pn2"},
+  {id:3,name:"Central Database Hub",mission:"Injecting the Security Path",icon:"ti-database",topColor:"#00ff88",pnClass:"pn3"},
+  {id:4,name:"Fuel & Hydraulic Bay",mission:"Reconstructing the Fuel Line",icon:"ti-droplet",topColor:"#ff8866",pnClass:"pn4"},
+  {id:5,name:"Signal Transmission Room",mission:"Reconstructing the Authorization Script",icon:"ti-antenna",topColor:"#aa88ff",pnClass:"pn5"},
+];
+const TCOL = ['tt1','tt2','tt3','tt4','tt5'];
+
+// ── FIREBASE HELPERS ──
+const R = (path) => ref(db, path);
+const fbGet = async (path) => { const s = await get(R(path)); return s.exists() ? s.val() : null; };
+const fbSet = (path, val) => set(R(path), val);
+const fbUpdate = (path, val) => update(R(path), val);
+const fbDel = (path) => remove(R(path));
+const fbOn = (path, cb) => { const unsub = onValue(R(path), s => cb(s.exists() ? s.val() : null)); unsubscribers.push(unsub); return unsub; };
+
+// ── SESSION STATE (in-memory only, no localStorage) ──
+let fbState = {};           // full Firebase snapshot
+let navDeck = '';
+let adminPosId = null;
+let pinVal = '';
+let unsubscribers = [];
+let notifiedFlags = {};
+
+
+// ── UTILS ──
+const pad = n => String(Math.floor(n)).padStart(2,'0');
+const fmt = s => { s=Math.max(0,s); return pad(s/60)+':'+pad(s%60); };
+const wc = len => len===0?'wt-green':len<=3?'wt-amber':'wt-red';
+const fc = len => len===0?'qf-green':len<=3?'qf-amber':'qf-red';
+const ws = (len,dur) => len===0?'OPEN':'~'+(len*dur)+'m';
+const toArr = obj => obj ? Object.values(obj).sort((a,b)=>a.num-b.num) : [];
+const getPosState = id => fbState['pos_'+id] || {duration:8,queue:{},timerRunning:false,timerEnd:null,nextNum:0};
+
+// ── SCREENS ──
+const showScreen = id => { document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); document.getElementById(id)?.classList.add('active'); };
+const showLoading = msg => { document.getElementById('loading-msg').textContent = msg||'Loading...'; document.getElementById('screen-loading').classList.add('active'); };
+const hideLoading = () => document.getElementById('screen-loading').classList.remove('active');
+
+// ── CLOCK ──
+setInterval(() => {
+  const n=new Date(); const el=document.getElementById('sys-time');
+  if(el) el.textContent=pad(n.getHours())+':'+pad(n.getMinutes())+':'+pad(n.getSeconds());
+}, 1000);
+
+// ── LOGOUT ──
+async function logout(){
+  unsubscribers.forEach(u=>u()); unsubscribers=[];
+  navDeck=''; adminPosId=null; pinVal=''; notifiedFlags={};
+  resetSteps(); showScreen('screen-role');
+}
+window.logout = logout;
+
+// ── INIT ──
+async function init(){
+  showLoading('Connecting...');
+  try {
+    const s = await fbGet('state');
+    if(!s){
+      const init = {};
+      POS_DEFS.forEach(p => { init['pos_'+p.id] = {duration:8,queue:{},timerRunning:false,timerEnd:null,nextNum:0}; });
+      await fbSet('state', init);
+    }
+    fbState = (await fbGet('state')) || {};
+    hideLoading(); showScreen('screen-role');
+    startGlobalTick();
+  } catch(e){ hideLoading(); showNotif('Connection error: '+e.message,'urgent'); showScreen('screen-role'); }
+}
+
+// ── GLOBAL TICK — updates timer displays every second ──
+function startGlobalTick(){
+  setInterval(() => {
+    POS_DEFS.forEach(def => {
+      const ps = getPosState(def.id);
+      if(!ps.timerRunning || !ps.timerEnd) return;
+      const rem = Math.max(0, Math.round((ps.timerEnd - Date.now())/1000));
+      const total = (ps.duration||8)*60;
+      updateTimerEl('timer-'+def.id, rem, total);
+      updateTimerEl('nav-timer-'+def.id, rem, total);
+      updateTimerEl('st-timer-'+def.id, rem, total);
+      updateTimerEl('db-timer-'+def.id, rem, total);
+      updateBarEl('timerbar-'+def.id, rem, total);
+      updateBarEl('nav-timerbar-'+def.id, rem, total);
+      updateBarEl('st-bar-'+def.id, rem, total);
+      if(navDeck) chkNotif(def.id, rem, total);
+      if(rem<=0) doEndExpired(def.id);
+    });
+  }, 1000);
+}
+function updateTimerEl(id, rem, total){
+  const el = document.getElementById(id);
+  if(el){ el.textContent=fmt(rem); el.className='timer-display'+(rem<=30?' danger':rem<=total*.3?' warning':''); }
+}
+function updateDbTimer(posId, rem, total){
+  const el = document.getElementById('db-timer-'+posId);
+  if(el){ el.textContent=fmt(rem); el.className='timer-display'+(rem<=30?' danger':rem<=total*.3?' warning':'')+ ' style-inline'; el.style.fontSize='13px'; }
+}
+function updateBarEl(id, rem, total){
+  const el = document.getElementById(id);
+  if(el){ el.style.width=Math.round((rem/total)*100)+'%'; el.className='timer-fill'+(rem<=30?' tf-red':rem<=total*.3?' tf-amber':' tf-green'); }
+}
+let endingPos = {};
+async function doEndExpired(posId){
+  if(endingPos[posId]) return;
+  endingPos[posId] = true;
+  await adminNext(posId, true);
+  delete endingPos[posId];
+}
+
+// ── PIN & ADMIN LOGIN ──
+window.pinPress = d => { if(pinVal.length>=4) return; pinVal+=d; updateDots(); if(pinVal.length===4) setTimeout(checkPin,100); };
+window.pinDel   = () => { pinVal=pinVal.slice(0,-1); updateDots(); };
+window.pinClear = () => { pinVal=''; updateDots(); };
+function updateDots(){ for(let i=0;i<4;i++) document.getElementById('pd'+i).classList.toggle('filled',i<pinVal.length); }
+function startLogin(role){
+  if(role==='admin'){ pinVal=''; updateDots(); document.getElementById('pin-err').textContent=''; document.getElementById('admin-pos-select').style.display='none'; document.getElementById('pin-pad-wrap').style.display='block'; showScreen('screen-pin'); }
+  else { document.getElementById('nav-deck-input').value=''; showScreen('screen-deck'); }
+}
+window.startLogin = startLogin;
+function checkPin(){
+  if(pinVal===ADMIN_PIN){ document.getElementById('pin-pad-wrap').style.display='none'; document.getElementById('admin-pos-select').style.display='block'; }
+  else { document.getElementById('pin-err').textContent='// ACCESS DENIED'; pinVal=''; updateDots(); }
+}
+window.selectAdminPos = async function(posId){
+  adminPosId = posId;
+  document.getElementById('admin-pos-label').textContent = '// '+POS_DEFS[posId-1].name.toUpperCase();
+  showScreen('screen-admin');
+  unsubscribers.forEach(u=>u()); unsubscribers=[];
+  // Listen to entire state so sidebar updates too
+  fbOn('state', s => {
+    fbState = s||{};
+    renderAdminSidebar(); renderAdminContent();
+    if(document.getElementById('admin-view-dashboard').classList.contains('active')) debounceDashboard();
+  });
+  fbOn('results', s => {
+    cachedResults = s||{};
+    renderAdminContent();
+    if(document.getElementById('admin-view-dashboard').classList.contains('active')) debounceDashboard();
+  });
+};
+
+// ── NAVIGATOR LOGIN ──
+window.navDeckConfirm = async function(){
+  const val = document.getElementById('nav-deck-input').value.trim();
+  if(!val){ showNotif('Enter your deck number','warning'); return; }
+  navDeck = val;
+  showLoading('Loading...');
+  try { fbState = (await fbGet('state')) || {}; } catch(e){}
+  hideLoading();
+  document.getElementById('nav-deck-err').textContent='';
+  document.getElementById('nav-deck-label').textContent = 'DECK '+navDeck;
+  resetSteps(); showScreen('screen-nav');
+  unsubscribers.forEach(u=>u()); unsubscribers=[];
+  // Listen to full state + results for this deck
+  fbOn('state', s => {
+    fbState = s||{};
+    renderFairnessBar();
+    renderNavStatus();
+    if(document.getElementById('nav-view-tickets').classList.contains('active')) renderTix();
+    if(document.getElementById('nav-view-reserve').classList.contains('active')) renderPosList();
+  });
+  fbOn('results', s => {
+    cachedResults = s||{};
+    renderFairnessBar();
+    if(document.getElementById('nav-view-tickets').classList.contains('active')) renderTix();
+    if(document.getElementById('nav-view-reserve').classList.contains('active')) renderPosList();
+  });
+  renderFairnessBar(); renderNavStatus();
+  // Count how many stations this deck has entries in
+  const count = POS_DEFS.filter(def => toArr(getPosState(def.id).queue).some(i=>i.deck===navDeck)).length;
+  if(count>0) showNotif(count+' active reservation(s) found for Deck '+navDeck,'success');
+};
+
+// ── RESULTS (Firebase only) ──
+const getResult = async (deck,posId) => await fbGet('results/'+deck+'/pos_'+posId);
+const saveResult = (deck,posId,val,ts) => fbSet('results/'+deck+'/pos_'+posId, {result:val, ts:ts||Date.now()});
+// Sync helper — get all results for nav deck at once
+let cachedResults = {};
+// cachedResults updated by role-specific listeners below
+const getResultSync = (deck,posId) => {
+  const r = cachedResults[deck] && cachedResults[deck]['pos_'+posId];
+  if(!r) return null;
+  // Handle both old string format and new {result, ts} format
+  return typeof r === 'object' ? r.result : r;
+};
+const getResultTs = (deck,posId) => {
+  const r = cachedResults[deck] && cachedResults[deck]['pos_'+posId];
+  if(!r || typeof r !== 'object') return null;
+  return r.ts || null;
+};
+const fmtTs = ts => {
+  if(!ts) return '';
+  const d = new Date(ts);
+  return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
+};
+
+// ── FAIRNESS (reads from Firebase state) ──
+function getActiveDeckPos(){
+  // Returns list of posIds where navDeck is currently in queue
+  return POS_DEFS.map(def => def.id).filter(id => toArr(getPosState(id).queue).some(i=>i.deck===navDeck));
+}
+function canReserve(posId){
+  const inQueue = toArr(getPosState(posId).queue).some(i=>i.deck===navDeck);
+  const res = getResultSync(navDeck, posId);
+  if(res==='passed') return {ok:false,reason:'passed'};
+  if(inQueue) return {ok:false,reason:'already'};
+  if(res==='failed') return {ok:true}; // retry allowed
+  const active = getActiveDeckPos();
+  if(active.length >= MAX_ACTIVE) return {ok:false,reason:'full'};
+  return {ok:true};
+}
+
+// ── REGISTER ──
+window.navConfirmRegister = async function(posId){
+  const chk = canReserve(posId);
+  if(!chk.ok){ showNotif(chk.reason==='passed'?'Already passed':chk.reason==='already'?'Already in queue':'Slot limit reached. Finish or cancel one first.','warning'); return; }
+  const ps = getPosState(posId);
+  const def = POS_DEFS[posId-1];
+  const num = (ps.nextNum||0)+1;
+  const q = toArr(ps.queue);
+  await fbUpdate('state/pos_'+posId, {nextNum:num});
+  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:navDeck,status:q.length===0?'playing':'waiting',method:'app'});
+  showNotif('Queue #'+String(num).padStart(2,'0')+' — '+def.name,'success');
+  resetSteps();
+  navTab('tickets', document.querySelectorAll('#screen-nav .tab')[1]);
+};
+
+window.cancelReservation = async function(posId){
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  const item = q.find(i=>i.deck===navDeck);
+  if(!item) return;
+  await fbDel('state/pos_'+posId+'/queue/'+item.num);
+  if(item.status==='playing'){
+    await fbUpdate('state/pos_'+posId, {timerRunning:false,timerEnd:null});
+    const rest = q.filter(i=>i.num!==item.num);
+    if(rest.length>0) await fbUpdate('state/pos_'+posId+'/queue/'+rest[0].num, {status:'playing'});
+  }
+  showNotif('Reservation cancelled','warning');
+};
+
+// ── ADMIN ACTIONS ──
+window.startTimer = async function(posId){
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  if(!q.length||ps.timerRunning) return;
+  const timerEnd = Date.now()+(ps.duration||8)*60000;
+  await fbUpdate('state/pos_'+posId, {timerRunning:true,timerEnd});
+  await fbUpdate('state/pos_'+posId+'/queue/'+q[0].num, {status:'playing'});
+};
+
+window.adminEndSession = async function(posId, result){
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  if(!q.length) return;
+  const deck = q[0].deck;
+  const ts = Date.now();
+  // Save result + timestamp together
+  await fbSet('results/'+deck+'/pos_'+posId, { result, ts });
+  await adminNext(posId, false);
+  showNotif('Deck '+deck+' — '+result.toUpperCase()+' at '+POS_DEFS[posId-1].name, result==='passed'?'success':'warning');
+};
+
+async function adminNext(posId, auto){
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  if(!q.length) return;
+  await fbDel('state/pos_'+posId+'/queue/'+q[0].num);
+  await fbUpdate('state/pos_'+posId, {timerRunning:false,timerEnd:null});
+  if(q.length>1){
+    await fbUpdate('state/pos_'+posId+'/queue/'+q[1].num, {status:'playing'});
+    chkQNotif(posId, q[1].deck);
+  }
+}
+
+window.adminAddDeck = async function(posId){
+  const inp = document.getElementById('add-deck-'+posId);
+  const val = inp?.value.trim();
+  if(!val){ showNotif('Enter deck number','warning'); return; }
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  const num = (ps.nextNum||0)+1;
+  await fbUpdate('state/pos_'+posId, {nextNum:num});
+  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:val,status:q.length===0?'playing':'waiting',method:'manual'});
+  if(inp) inp.value='';
+  showNotif('Deck '+val+' added','success');
+};
+
+window.adminRm = async function(posId, num){
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  const item = q.find(i=>i.num===num);
+  if(!item) return;
+  await fbDel('state/pos_'+posId+'/queue/'+num);
+  if(item.status==='playing'){
+    await fbUpdate('state/pos_'+posId, {timerRunning:false,timerEnd:null});
+    const rest = q.filter(i=>i.num!==num);
+    if(rest.length>0) await fbUpdate('state/pos_'+posId+'/queue/'+rest[0].num, {status:'playing'});
+  }
+};
+
+window.adminCall  = async (posId,num) => fbUpdate('state/pos_'+posId+'/queue/'+num, {status:'called'});
+window.adminSkip  = async (posId,num) => fbUpdate('state/pos_'+posId+'/queue/'+num, {status:'waiting'});
+window.changeDur  = async (posId,d) => { const ps=getPosState(posId); await fbUpdate('state/pos_'+posId, {duration:Math.max(1,(ps.duration||8)+d)}); };
+
+// ── NOTIFICATIONS ──
+function chkNotif(posId, rem, total){
+  if(!navDeck) return;
+  const q = toArr(getPosState(posId).queue);
+  const idx = q.findIndex(i=>i.deck===navDeck);
+  if(idx!==1) return;
+  const key = posId+'_'+(q[1]?.num||'');
+  if(rem<=60&&rem>55&&!notifiedFlags[key+'_60']){ notifiedFlags[key+'_60']=true; showNotif('⚡ Get ready! '+POS_DEFS[posId-1].name+' in ~1 min','warning'); }
+  if(rem<=15&&rem>10&&!notifiedFlags[key+'_15']){ notifiedFlags[key+'_15']=true; showNotif('🚨 MOVE NOW — '+POS_DEFS[posId-1].name+' — your turn is NEXT!','urgent'); }
+}
+function chkQNotif(posId, deck){
+  if(navDeck && navDeck===deck) showNotif('🎮 Your turn at '+POS_DEFS[posId-1].name+'!','urgent');
+}
+function showNotif(msg, type='success'){
+  const panel = document.getElementById('notif-panel');
+  const div = document.createElement('div');
+  div.className = 'notif'+(type==='warning'?' warning':type==='urgent'?' urgent':'');
+  div.innerHTML = `<span style="font-size:16px;flex-shrink:0">${type==='urgent'?'<i class="ti ti-alert-triangle"></i>':type==='warning'?'<i class="ti ti-bell"></i>':'<i class="ti ti-check"></i>'}</span><span style="flex:1">${msg}</span><span class="notif-close" onclick="this.parentElement.remove()"><i class="ti ti-x"></i></span>`;
+  panel.appendChild(div);
+  setTimeout(()=>{ if(div.parentElement) div.remove(); }, 5000);
+}
+window.showNotif = showNotif;
+
+// ── RENDER: FAIRNESS BAR ──
+function renderFairnessBar(){
+  const el = document.getElementById('nav-fairness-bar'); if(!el) return;
+  const lb = document.getElementById('nav-limit-banner');
+  const active = getActiveDeckPos();
+  let passed=0, failed=0;
+  POS_DEFS.forEach(def => { const r=getResultSync(navDeck,def.id); if(r==='passed') passed++; if(r==='failed') failed++; });
+  const slots = POS_DEFS.map(def => {
+    const r = getResultSync(navDeck, def.id);
+    if(r==='passed') return '<div style="flex:1;height:6px;border-radius:2px;background:var(--green)"></div>';
+    if(r==='failed') return '<div style="flex:1;height:6px;border-radius:2px;background:var(--red)"></div>';
+    if(active.includes(def.id)) return '<div style="flex:1;height:6px;border-radius:2px;background:var(--amber);animation:slotPulse 1.5s infinite"></div>';
+    return '<div style="flex:1;height:6px;border-radius:2px;background:var(--border2)"></div>';
+  }).join('');
+  el.innerHTML = `<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:4px;padding:12px 14px;margin-bottom:10px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <span style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">MISSION PROGRESS — DECK ${navDeck}</span>
+      <span style="font-family:var(--font-mono);font-size:11px;color:var(--green)">${passed}/${TOTAL_POS} PASSED</span>
+    </div>
+    <div style="display:flex;gap:4px">${slots}</div>
+    <div style="display:flex;gap:12px;margin-top:8px;font-family:var(--font-mono);font-size:10px;color:var(--text3)">
+      <span style="color:var(--green)">■ Passed (${passed})</span>
+      <span style="color:var(--red)">■ Failed (${failed})</span>
+      <span style="color:var(--amber)">■ Active (${active.length})</span>
+      <span>■ Pending (${TOTAL_POS-passed-failed-active.length})</span>
+    </div></div>`;
+  if(!lb) return;
+  if(passed===TOTAL_POS){ lb.innerHTML=`<div class="banner-success"><i class="ti ti-trophy" style="font-size:18px"></i> All 5 missions PASSED! Outstanding, Deck ${navDeck}.</div>`; }
+  else if(active.length>=MAX_ACTIVE){ lb.innerHTML=`<div class="banner-warn"><i class="ti ti-lock" style="font-size:18px;flex-shrink:0"></i><span>Slot limit reached (${active.length}/${MAX_ACTIVE}). Finish or cancel one first.</span></div>`; }
+  else { lb.innerHTML=`<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-bottom:10px"><i class="ti ti-info-circle"></i> ${active.length}/${MAX_ACTIVE} active slots &nbsp;·&nbsp; ${TOTAL_POS-passed-failed-active.length} stations remaining</div>`; }
+}
+
+// ── RENDER: NAV POS LIST ──
+function renderPosList(){
+  const el = document.getElementById('nav-pos-list'); if(!el) return;
+  el.innerHTML = POS_DEFS.map(def => {
+    const ps = getPosState(def.id);
+    const q = toArr(ps.queue);
+    const len = q.length, dur = ps.duration||8;
+    const pct = Math.min(100,(len/7)*100);
+    const res = getResultSync(navDeck, def.id);
+    const inQueue = q.some(i=>i.deck===navDeck);
+    let tag='', cls='pos-card available', click=`onclick="selPos(${def.id})"`;
+    if(res==='passed'){ tag=mkTag('check','#7aaa88','rgba(0,255,136,.05)','rgba(0,255,136,.15)','Passed'); cls='pos-card done-card'; click=''; }
+    else if(res==='failed'){ tag=mkTag('refresh','#ff4444','rgba(255,68,68,.1)','rgba(255,68,68,.3)','Failed — Retry'); }
+    else if(inQueue){ tag=mkTag('clock','#ffb800','rgba(255,184,0,.1)','rgba(255,184,0,.3)','In queue'); cls='pos-card locked'; click=''; }
+    else if(getActiveDeckPos().length>=MAX_ACTIVE){ tag=mkTag('lock','#ff4444','rgba(255,68,68,.1)','rgba(255,68,68,.3)','Slots full'); cls='pos-card locked'; click=''; }
+    return `<div class="${cls}" id="npc-${def.id}" ${click}>
+      <div class="pos-num ${def.pnClass}">S${def.id}</div>
+      <div class="pos-body"><div class="pos-name">${def.name}</div>
+        <div class="pos-mission">&gt; ${def.mission}</div>
+        <div class="qbar"><div class="qfill ${fc(len)}" style="width:${pct}%"></div></div>
+      </div>
+      <div class="pos-right">
+        <div class="wait-tag ${wc(len)}">${ws(len,dur)}</div>
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:3px">${len} queued</div>
+        ${tag?`<div style="margin-top:4px">${tag}</div>`:''}
+      </div></div>`;
+  }).join('');
+}
+function mkTag(icon,color,bg,border,label){ return `<span style="font-size:9px;padding:2px 8px;border-radius:2px;font-weight:700;text-transform:uppercase;background:${bg};color:${color};border:1px solid ${border}"><i class="ti ti-${icon}"></i> ${label}</span>`; }
+
+window.selPos = function(id){
+  const chk = canReserve(id);
+  if(!chk.ok){ showNotif('Cannot reserve this station','warning'); return; }
+  document.querySelectorAll('#nav-pos-list .pos-card').forEach(c=>c.classList.remove('sel'));
+  document.getElementById('npc-'+id)?.classList.add('sel');
+  const area = document.getElementById('nav-app-confirm');
+  if(area){ area.style.display='block'; area.innerHTML=confirmHTML(id); area.scrollIntoView({behavior:'smooth',block:'nearest'}); }
+};
+
+function confirmHTML(posId){
+  const def=POS_DEFS[posId-1], ps=getPosState(posId), q=toArr(ps.queue), len=q.length, dur=ps.duration||8;
+  const chk=canReserve(posId);
+  if(!chk.ok) return `<div class="confirm-box" style="border-top:2px solid var(--red);border-color:rgba(255,68,68,.3)"><div style="font-size:28px;color:var(--red);margin-bottom:8px"><i class="ti ti-lock"></i></div><div style="font-size:14px;font-weight:700;color:var(--red)">Cannot Reserve</div><button class="btn btn-full" style="margin-top:16px;justify-content:center" onclick="navCancelConfirm()"><i class="ti ti-x"></i> Close</button></div>`;
+  return `<div class="confirm-box" style="border-top:2px solid ${def.topColor};border-color:${def.topColor}44">
+    <div style="font-family:var(--font-mono);font-size:10px;letter-spacing:2px;color:var(--text3)"><i class="ti ${def.icon}"></i> STATION ${posId}</div>
+    <div style="font-size:14px;font-weight:700;margin:4px 0 2px;color:var(--text)">${def.name}</div>
+    <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">${def.mission}</div>
+    <div style="font-family:var(--font-mono);font-size:40px;font-weight:600;color:var(--green);letter-spacing:4px;text-shadow:0 0 20px rgba(0,255,136,.4);margin:12px 0 6px">DECK ${navDeck}</div>
+    <div style="font-size:13px;color:var(--text2);font-weight:600">${len} groups queued</div>
+    <div style="font-family:var(--font-mono);font-size:11px;color:var(--text3);margin-top:4px">Est. wait ~${len*dur}m · Play ${dur}m</div>
+    <div style="margin-top:6px;font-family:var(--font-mono);font-size:10px;color:var(--amber)"><i class="ti ti-info-circle"></i> Active slots after: ${getActiveDeckPos().length+1}/${MAX_ACTIVE}</div>
+    <div style="display:flex;gap:8px;margin-top:16px">
+      <button class="btn" style="flex:1;justify-content:center" onclick="navCancelConfirm()"><i class="ti ti-x"></i> Cancel</button>
+      <button class="btn btn-primary" style="flex:2;padding:10px" onclick="navConfirmRegister(${posId})"><i class="ti ti-check"></i> Confirm Reservation</button>
+    </div></div>`;
+}
+
+window.navCancelConfirm = () => {
+  document.getElementById('nav-app-confirm').style.display='none';
+  document.getElementById('nav-scan-confirm').style.display='none';
+  document.querySelectorAll('#nav-pos-list .pos-card').forEach(c=>c.classList.remove('sel'));
+};
+
+// ── RENDER: NAV TICKETS ──
+function renderTix(){
+  const area=document.getElementById('nav-ticket-area'), noT=document.getElementById('nav-no-ticket');
+  // Build ticket list from Firebase state — find all queue entries for this deck
+  const tickets = [];
+  POS_DEFS.forEach(def => {
+    const ps = getPosState(def.id);
+    const q = toArr(ps.queue);
+    const item = q.find(i=>i.deck===navDeck);
+    const res = getResultSync(navDeck, def.id);
+    if(item) tickets.push({def, ps, item, q, res}); // only active queue entries
+  });
+  if(!tickets.length){ noT.style.display='block'; area.innerHTML=''; return; }
+  noT.style.display='none';
+  area.innerHTML = tickets.map(({def,ps,item,q,res}) => {
+    const myIdx = item ? q.findIndex(i=>i.num===item.num) : -1;
+    const ahead = myIdx>=0 ? myIdx : 0;
+    const dur = ps.duration||8;
+    const inQueue = myIdx>=0;
+    const num = item ? item.num : 0;
+    const resTs = getResultTs(navDeck, def.id);
+    const resBadge = res==='passed'
+      ? mkTag('check','#7aaa88','rgba(0,255,136,.05)','rgba(0,255,136,.15)','Passed'+(resTs?' · '+fmtTs(resTs):''))
+      : res==='failed'
+      ? mkTag('x','#ff4444','rgba(255,68,68,.1)','rgba(255,68,68,.3)','Failed'+(resTs?' · '+fmtTs(resTs):''))
+      : '';
+    const cancelBtn = inQueue?`<button onclick="cancelReservation(${def.id})" style="margin-left:auto;padding:4px 10px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:transparent;color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Cancel</button>`:'';
+    const st = myIdx===0?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active</span>':myIdx===1?'<span class="badge badge-amber">You\'re next</span>':myIdx>1?`<span class="badge badge-gray">${ahead} ahead</span>`:'';
+    const remSecs = inQueue&&myIdx===0&&ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
+    const total = dur*60;
+    const countdown = remSecs!==null?`<div class="ticket-countdown">
+      <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-bottom:4px;letter-spacing:1px">TIME REMAINING</div>
+      <div id="nav-timer-${def.id}" class="timer-display${remSecs<=30?' danger':remSecs<=total*.3?' warning':''}">${fmt(remSecs)}</div>
+      <div class="timer-bar"><div id="nav-timerbar-${def.id}" class="timer-fill${remSecs<=30?' tf-red':remSecs<=total*.3?' tf-amber':' tf-green'}" style="width:${Math.round((remSecs/total)*100)}%"></div></div>
+    </div>`:'';
+    const mBadge = item?.method==='scan'?'<span class="badge badge-green" style="font-size:10px"><i class="ti ti-scan"></i> Scan</span>':item?.method==='manual'?'<span class="badge badge-gray" style="font-size:10px"><i class="ti ti-pencil"></i> Admin</span>':'<span class="badge badge-blue" style="font-size:10px"><i class="ti ti-device-mobile"></i> App</span>';
+    return `<div class="card" style="padding:0;overflow:hidden;margin-bottom:12px;${!inQueue?'opacity:.7':''}">
+      <div class="ticket ${TCOL[def.id-1]}" style="border:none;border-radius:0">
+        <div class="ticket-station-id"><i class="ti ${def.icon}"></i> STATION ${def.id}</div>
+        <div class="ticket-main-name">${def.name}</div>
+        <div class="ticket-mission">&gt; ${def.mission}</div>
+        <div class="ticket-deck-small">DECK ${navDeck}</div>
+        <div class="ticket-stats">
+          <div><div class="tstat-val">${!inQueue?'✓':ahead===0?'—':ahead*dur+'m'}</div><div class="tstat-lbl">${!inQueue?'Done':'Est. Wait'}</div></div>
+          <div><div class="tstat-val">${!inQueue?'✓':ahead}</div><div class="tstat-lbl">Ahead</div></div>
+          <div><div class="tstat-val">${dur}m</div><div class="tstat-lbl">Play Time</div></div>
+        </div>${countdown}
+      </div>
+      <div style="padding:8px 1.25rem;display:flex;align-items:center;gap:6px;flex-wrap:wrap;border-top:1px solid var(--border2)">
+        ${st}${resBadge} ${mBadge}${cancelBtn}
+      </div></div>`;
+  }).join('');
+}
+
+// ── RENDER: NAV STATUS ──
+function renderNavStatus(){
+  const el = document.getElementById('nav-est-grid'); if(!el) return;
+  el.innerHTML = POS_DEFS.map(def => {
+    const ps = getPosState(def.id);
+    const q = toArr(ps.queue), len=q.length, dur=ps.duration||8;
+    const myItem = q.find(i=>i.deck===navDeck);
+    const myIdx = myItem ? q.findIndex(i=>i.num===myItem.num) : -1;
+    const res = getResultSync(navDeck, def.id);
+    const remSecs = ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
+    const timerHtml = remSecs!==null?`<div style="margin-top:6px">
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:1px;margin-bottom:2px">CURRENT SLOT</div>
+      <div id="st-timer-${def.id}" class="timer-display${remSecs<=30?' danger':remSecs<=dur*60*.3?' warning':''}" style="font-size:14px">${fmt(remSecs)}</div>
+      <div class="timer-bar" style="margin-top:4px"><div id="st-bar-${def.id}" class="timer-fill ${remSecs<=30?'tf-red':remSecs<=dur*60*.3?'tf-amber':'tf-green'}" style="width:${Math.round((remSecs/(dur*60))*100)}%"></div></div>
+    </div>`:len>0&&!ps.timerRunning?`<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:4px">Waiting for admin</div>`:'';
+    const myStatus = myIdx===0?'<span class="badge badge-green" style="font-size:10px">Active now</span>':myIdx===1?'<span class="badge badge-amber" style="font-size:10px">You\'re next</span>':myIdx>1?`<span class="badge badge-gray" style="font-size:10px">${myIdx} ahead</span>`:'';
+    return `<div class="est-card" style="border-left:2px solid ${def.topColor}">
+      <div class="pos-num ${def.pnClass}" style="flex-shrink:0">S${def.id}</div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:700;color:var(--text)">${def.name}</div>
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">&gt; ${def.mission}</div>
+        ${myItem?`<div style="margin-top:4px"><span class="badge badge-green" style="font-size:10px">Queue #${String(myItem.num).padStart(2,'0')}</span> ${myStatus}</div>`:''}
+        ${res?`<div style="margin-top:4px">${mkTag(res==='passed'?'check':'x',res==='passed'?'#7aaa88':'#ff4444',res==='passed'?'rgba(0,255,136,.05)':'rgba(255,68,68,.1)',res==='passed'?'rgba(0,255,136,.15)':'rgba(255,68,68,.3)',res==='passed'?'Passed':'Failed')}</div>`:''}
+        ${timerHtml}
+      </div>
+      <div style="text-align:right;flex-shrink:0">
+        <div class="wait-tag ${wc(len)}">${ws(len,dur)}</div>
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:3px">${len} queued · ${dur}m/slot</div>
+      </div></div>`;
+  }).join('');
+}
+
+// ── RENDER: ADMIN SIDEBAR ──
+function renderAdminSidebar(){
+  const el = document.getElementById('admin-sidebar'); if(!el) return;
+  el.innerHTML = POS_DEFS.map(def => {
+    const ps = getPosState(def.id);
+    const q = toArr(ps.queue), len=q.length, isActive=def.id===adminPosId;
+    return `<button class="apos-tab${isActive?' active':''}" onclick="selectAdminPos(${def.id})">
+      <div class="apos-num" style="border-color:${def.topColor}44;color:${def.topColor}">S${def.id}</div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${def.name}</div>
+        <div style="font-family:var(--font-mono);font-size:10px;opacity:.6">${len} · ${ps.duration||8}m${ps.timerRunning?' ⏱':''}</div>
+      </div>
+      ${len>0?`<span style="background:${len<=2?'rgba(0,255,136,.1)':'rgba(255,68,68,.1)'};color:${len<=2?'var(--green)':'var(--red)'};font-size:10px;padding:1px 6px;border-radius:2px;font-family:var(--font-mono)">${len}</span>`:''}
+    </button>`;
+  }).join('');
+}
+
+// ── RENDER: ADMIN CONTENT ──
+function renderAdminContent(){
+  const el = document.getElementById('admin-content'); if(!el||!adminPosId) return;
+  const def=POS_DEFS[adminPosId-1], ps=getPosState(adminPosId), q=toArr(ps.queue), dur=ps.duration||8;
+  const rem = ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
+  const total = dur*60;
+
+  let timerBlock='';
+  if(q.length>0){
+    const first=q[0];
+    if(ps.timerRunning&&rem!==null){
+      timerBlock=`<div class="card" style="margin-bottom:10px;border-color:rgba(0,255,136,.3)">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <span style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">ACTIVE SLOT TIMER</span>
+          <span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--green)">DECK ${first.deck}</span>
+        </div>
+        <div id="timer-${adminPosId}" class="timer-display${rem<=30?' danger':rem<=total*.3?' warning':''}">${fmt(rem)}</div>
+        <div class="timer-bar"><div id="timerbar-${adminPosId}" class="timer-fill${rem<=30?' tf-red':rem<=total*.3?' tf-amber':' tf-green'}" style="width:${Math.round((rem/total)*100)}%"></div></div>
+        <div style="margin-top:10px;display:flex;gap:6px">
+          <button onclick="adminEndSession(${adminPosId},'passed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
+          <button onclick="adminEndSession(${adminPosId},'failed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
+        </div></div>`;
+    } else {
+      timerBlock=`<div class="card" style="margin-bottom:10px;border-style:dashed">
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-bottom:8px">READY TO START</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <span style="font-size:13px;font-weight:700;color:var(--text)">DECK ${first.deck}</span>
+          <span style="font-family:var(--font-mono);font-size:11px;color:var(--text3)">${dur}m session</span>
+        </div>
+        <button class="btn btn-primary" onclick="startTimer(${adminPosId})"><i class="ti ti-player-play"></i> Start Session</button></div>`;
+    }
+  }
+
+  const waiting = q.slice(1);
+  const waitHtml = waiting.length?
+    `<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:6px">QUEUE (${waiting.length})</div>`+
+    waiting.map((item,i)=>{
+      const mIcon=item.method==='scan'?'ti-scan':item.method==='manual'?'ti-pencil':'ti-device-mobile';
+      const badge=item.status==='called'?'<span class="badge badge-amber">Called</span>':'<span class="badge badge-gray">Waiting</span>';
+      return `<div class="q-item${item.status==='called'?' called':''}">
+        <div class="qnum">${item.num}</div>
+        <div class="qi-info"><div class="qi-name">DECK ${item.deck}</div>
+          <div class="qi-sub">${badge} <i class="ti ${mIcon}" style="font-size:11px;opacity:.5"></i></div></div>
+        <div style="display:flex;gap:4px">
+          ${i===0?`<button class="btn btn-sm btn-amber" onclick="adminCall(${adminPosId},${item.num})">Call</button>`:`<button class="btn btn-sm" onclick="adminSkip(${adminPosId},${item.num})" style="color:var(--text3)">Skip</button>`}
+          <button class="btn btn-sm btn-red" onclick="adminRm(${adminPosId},${item.num})"><i class="ti ti-trash"></i></button>
+        </div></div>`;
+    }).join(''):
+    `<div class="empty-state" style="padding:1rem 0"><i class="ti ti-users"></i>No one queued</div>`;
+
+  el.innerHTML = `
+    <div style="padding:10px 12px;background:var(--bg3);border-radius:4px;margin-bottom:10px;border-left:2px solid ${def.topColor}">
+      <div style="font-size:13px;font-weight:700;color:${def.topColor}"><i class="ti ${def.icon}"></i> ${def.name}</div>
+      <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:2px">&gt; ${def.mission}</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;font-family:var(--font-mono);font-size:11px;color:var(--text3)">DURATION/SLOT:
+      <div style="display:flex;align-items:center;gap:6px">
+        <button class="dur-btn" onclick="changeDur(${adminPosId},-1)">−</button>
+        <span style="font-family:var(--font-mono);font-size:12px;min-width:40px;text-align:center;color:var(--text)">${dur}m</span>
+        <button class="dur-btn" onclick="changeDur(${adminPosId},1)">+</button>
+      </div>
+    </div>
+    <div class="add-deck-row"><input id="add-deck-${adminPosId}" placeholder="Deck number" maxlength="6" onkeydown="if(event.key==='Enter') adminAddDeck(${adminPosId})"/><button class="btn btn-blue btn-sm" onclick="adminAddDeck(${adminPosId})"><i class="ti ti-plus"></i> Add</button></div>
+    ${timerBlock}${waitHtml}`;
+}
+
+// renderAdminQR removed
+
+// ── TABS ──
+window.navTab = function(name,btn){
+  document.querySelectorAll('#screen-nav .tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('#screen-nav .view').forEach(v=>v.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  document.getElementById('nav-view-'+name).classList.add('active');
+  if(name==='reserve'){ renderFairnessBar(); renderPosList(); }
+  if(name==='tickets') renderTix();
+  if(name==='status') renderNavStatus();
+};
+function renderDashboard(){
+  const el = document.getElementById('admin-dashboard-content'); if(!el) return;
+  const filter = window._dashFilter || 'all';
+
+  // Build history from results + current queues
+  const rows = [];
+  const res = cachedResults||{};
+  POS_DEFS.forEach(def=>{
+    const ps = getPosState(def.id);
+    const q = toArr(ps.queue);
+    const dur = ps.duration||8;
+    const rem = ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
+
+    // Active / waiting rows from current queue
+    q.forEach((item,i)=>{
+      rows.push({
+        posId:def.id, posName:def.name, posIcon:def.icon, topColor:def.topColor, pnClass:def.pnClass,
+        deck:item.deck,
+        status: item.status==='playing'?(ps.timerRunning?'playing':'ready'):item.status==='called'?'called':'waiting',
+        rem, dur, position:i+1, queueLen:q.length
+      });
+    });
+
+    // Completed (passed/failed) from results
+    Object.entries(res).forEach(([deck, deckRes])=>{
+      if(!deckRes) return;
+      const raw = deckRes['pos_'+def.id];
+      if(!raw) return;
+      // Support both old string format and new {result, ts} object
+      const resultStr = typeof raw === 'object' ? raw.result : raw;
+      if(!resultStr) return;
+      // Only add if not already in queue
+      if(q.some(i=>i.deck===deck)) return;
+      rows.push({
+        posId:def.id, posName:def.name, posIcon:def.icon, topColor:def.topColor, pnClass:def.pnClass,
+        deck, status:resultStr, rem:null, dur, position:null, queueLen:0
+      });
+    });
+  });
+
+  // Filter
+  const filtered = filter==='all' ? rows :
+    filter==='active' ? rows.filter(r=>['playing','ready','called'].includes(r.status)) :
+    filter==='waiting' ? rows.filter(r=>r.status==='waiting') :
+    filter==='passed' ? rows.filter(r=>r.status==='passed') :
+    filter==='failed' ? rows.filter(r=>r.status==='failed') : rows;
+
+  // Stats
+  const stats = {
+    playing: rows.filter(r=>r.status==='playing'||r.status==='ready').length,
+    waiting: rows.filter(r=>r.status==='waiting').length,
+    passed:  rows.filter(r=>r.status==='passed').length,
+    failed:  rows.filter(r=>r.status==='failed').length,
+  };
+
+  const statusConfig = {
+    playing: {label:'Playing',    color:'var(--green)',  bg:'rgba(0,255,136,.1)',  icon:'ti-player-play'},
+    ready:   {label:'Ready',      color:'var(--blue)',   bg:'rgba(0,170,255,.1)',  icon:'ti-player-play'},
+    called:  {label:'Called',     color:'var(--amber)',  bg:'rgba(255,184,0,.1)',  icon:'ti-bell'},
+    waiting: {label:'Waiting',    color:'var(--text3)',  bg:'rgba(255,255,255,.05)',icon:'ti-clock'},
+    passed:  {label:'Passed',     color:'var(--green)',  bg:'rgba(0,255,136,.08)', icon:'ti-check'},
+    failed:  {label:'Failed',     color:'var(--red)',    bg:'rgba(255,68,68,.1)',  icon:'ti-x'},
+  };
+
+  const filterBtns = ['all','active','waiting','passed','failed'].map(f=>{
+    const labels = {all:'All',active:'Active',waiting:'Waiting',passed:'Passed',failed:'Failed'};
+    const active = filter===f;
+    return `<button onclick="setDashFilter('${f}')" style="padding:5px 12px;border-radius:3px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;letter-spacing:.5px;transition:all .15s;border:1px solid ${active?'var(--green)':'var(--border2)'};background:${active?'var(--green-dark)':'transparent'};color:${active?'var(--green)':'var(--text3)'};">${labels[f]}</button>`;
+  }).join('');
+
+  const tableRows = filtered.length ? filtered.map(row=>{
+    const sc = statusConfig[row.status]||{label:row.status,color:'var(--text3)',bg:'transparent',icon:'ti-circle'};
+    const timerCell = row.status==='playing'&&row.rem!==null
+      ? `<span id="db-timer-${row.posId}" class="timer-display${row.rem<=30?' danger':row.rem<=(row.dur*60*.3)?' warning':''}" style="font-size:13px">${fmt(row.rem)}</span>`
+      : row.position ? `<span style="font-family:var(--font-mono);font-size:11px;color:var(--text3)">#${row.position} of ${row.queueLen}</span>` : '—';
+    return `<tr style="border-bottom:1px solid var(--border2)">
+      <td style="padding:8px 10px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="pos-num ${row.pnClass}" style="width:26px;height:26px;font-size:10px;flex-shrink:0">S${row.posId}</div>
+          <div>
+            <div style="font-size:12px;font-weight:700;color:var(--text)">${row.posName}</div>
+          </div>
+        </div>
+      </td>
+      <td style="padding:8px 10px;font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--text)">DECK ${row.deck}</td>
+      <td style="padding:8px 10px">
+        <span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:3px 10px;border-radius:2px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;font-family:var(--font-ui);background:${sc.bg};color:${sc.color};border:1px solid ${sc.color}33">
+          <i class="ti ${sc.icon}"></i> ${sc.label}
+        </span>
+      </td>
+      <td style="padding:8px 10px;text-align:right">${timerCell}</td>
+      <td style="padding:8px 10px;text-align:right;font-family:var(--font-mono);font-size:11px">
+        ${(row.status==='passed'||row.status==='failed')?
+          `<span style="color:${row.status==='passed'?'var(--green)':'var(--text3)'}">${fmtTs(getResultTs(row.deck,row.posId))}</span>`
+          :'—'}
+      </td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="4" style="padding:2rem;text-align:center;color:var(--text3);font-family:var(--font-mono);font-size:12px">No data</td></tr>`;
+
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:1.25rem">
+      <div class="dash-card"><div class="dash-val" style="color:var(--green)">${stats.playing}</div><div class="dash-lbl">Playing</div></div>
+      <div class="dash-card"><div class="dash-val" style="color:var(--text3)">${stats.waiting}</div><div class="dash-lbl">Waiting</div></div>
+      <div class="dash-card"><div class="dash-val" style="color:var(--green)">${stats.passed}</div><div class="dash-lbl">Passed</div></div>
+      <div class="dash-card"><div class="dash-val" style="color:var(--red)">${stats.failed}</div><div class="dash-lbl">Failed</div></div>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">${filterBtns}</div>
+    <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border2)">
+            <th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">STATION</th>
+            <th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">DECK</th>
+            <th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">STATUS</th>
+            <th style="text-align:right;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">TIMER / POS</th>
+            <th style="text-align:right;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">COMPLETED</th>
+          </tr>
+        </thead>
+        <tbody>${tableRows}</tbody>
+      </table>
+    </div>`;
+}
+
+let _dashDebounce = null;
+function debounceDashboard(){
+  clearTimeout(_dashDebounce);
+  _dashDebounce = setTimeout(renderDashboard, 300);
+}
+
+window.setDashFilter = function(f){
+  window._dashFilter = f;
+  renderDashboard();
+};
+
+window.adminTab = function(name,btn){
+  document.querySelectorAll('#screen-admin .tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('#screen-admin .view').forEach(v=>v.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  document.getElementById('admin-view-'+name).classList.add('active');
+  if(name==='dashboard') renderDashboard();
+};
+
+// ── RESERVE STEPS ──
+function resetSteps(){
+  const sc=document.getElementById('nav-scan-confirm'); if(sc) sc.style.display='none';
+  const ac=document.getElementById('nav-app-confirm'); if(ac) ac.style.display='none';
+  document.querySelectorAll('#nav-pos-list .pos-card').forEach(c=>c.classList.remove('sel'));
+}
+
+
+
+// ── RESET ──
+window.confirmReset = function(){
+  document.getElementById('reset-confirm-input').value='';
+  const btn=document.getElementById('reset-confirm-btn');
+  btn.disabled=true; btn.style.opacity='.4'; btn.style.cursor='not-allowed';
+  document.getElementById('reset-modal').style.display='flex';
+};
+window.closeReset = function(){
+  document.getElementById('reset-modal').style.display='none';
+};
+window.checkResetInput = function(){
+  const ok = document.getElementById('reset-confirm-input').value==='RESET';
+  const btn = document.getElementById('reset-confirm-btn');
+  btn.disabled=!ok; btn.style.opacity=ok?'1':'.4'; btn.style.cursor=ok?'pointer':'not-allowed';
+};
+window.doReset = async function(){
+  if(document.getElementById('reset-confirm-input').value!=='RESET') return;
+  showLoading('Resetting all data...');
+  try {
+    const updates={};
+    POS_DEFS.forEach(def=>{
+      updates['state/pos_'+def.id+'/queue']=null;
+      updates['state/pos_'+def.id+'/timerRunning']=false;
+      updates['state/pos_'+def.id+'/timerEnd']=null;
+      updates['state/pos_'+def.id+'/nextNum']=0;
+    });
+    updates['results']=null;
+    updates['presence']=null;
+    await update(ref(db), updates);
+    hideLoading(); closeReset();
+    showNotif('All data has been reset','success');
+  } catch(e){ hideLoading(); showNotif('Reset failed: '+e.message,'urgent'); }
+};
+
+// ── BOOT ──
+
+init();
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--green:#00ff88;--green-dim:#00cc6a;--green-dark:#003d1f;--green-glow:rgba(0,255,136,.15);--amber:#ffb800;--red:#ff4444;--blue:#00aaff;--bg:#0a0f0a;--bg2:#0f160f;--bg3:#141e14;--border2:#2a3e2a;--border3:#00ff8833;--text:#c8f0d0;--text2:#7aaa88;--text3:#4a6a52;--font-mono:'Share Tech Mono',monospace;--font-ui:'Rajdhani',sans-serif;}
+body{font-family:var(--font-ui);background:var(--bg);color:var(--text);min-height:100vh;position:relative;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,255,136,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.04) 1px,transparent 1px);background-size:32px 32px;pointer-events:none;z-index:0}
+body::after{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 50% 0%,rgba(0,255,136,.08) 0%,transparent 60%);pointer-events:none;z-index:0}
+.app{position:relative;z-index:1;padding:1rem;max-width:720px;margin:0 auto}
+.scanline{position:fixed;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--green),transparent);opacity:.3;animation:scanline 4s linear infinite;pointer-events:none;z-index:100}
+@keyframes scanline{0%{top:-2px}100%{top:100vh}}
+.sys-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem;padding-bottom:10px;border-bottom:1px solid var(--border3)}
+.sys-logo{font-family:var(--font-mono);font-size:13px;color:var(--green);letter-spacing:2px}.sys-logo span{opacity:.5}
+.sys-status{font-family:var(--font-mono);font-size:10px;color:var(--text3);display:flex;align-items:center;gap:8px}
+.pulse-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(0,255,136,.4)}50%{opacity:.7;box-shadow:0 0 0 4px rgba(0,255,136,0)}}
+.screen{display:none}.screen.active{display:block}
+.view{display:none}.view.active{display:block}
+.card{background:var(--bg2);border:1px solid var(--border2);border-radius:4px;padding:1rem 1.25rem;margin-bottom:10px;position:relative}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--green-dim),transparent);opacity:.4}
+.tab-bar{display:flex;gap:4px;margin-bottom:1.25rem;border-bottom:1px solid var(--border2)}
+.tab{padding:8px 14px;background:transparent;border:none;border-bottom:2px solid transparent;cursor:pointer;font-size:12px;font-weight:600;letter-spacing:1px;text-transform:uppercase;font-family:var(--font-ui);color:var(--text3);display:inline-flex;align-items:center;gap:5px;margin-bottom:-1px;transition:all .2s}
+.tab:hover{color:var(--text2)}.tab.active{color:var(--green);border-bottom-color:var(--green)}
+.section-label{font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.section-label::after{content:'';flex:1;height:1px;background:var(--border2)}
+.role-card{background:var(--bg2);border:1px solid var(--border2);border-radius:4px;padding:1.25rem;cursor:pointer;display:flex;align-items:center;gap:14px;margin-bottom:8px;transition:all .2s;position:relative;overflow:hidden}
+.role-card::after{content:'';position:absolute;inset:0;background:var(--green-glow);opacity:0;transition:opacity .2s}
+.role-card:hover::after{opacity:1}.role-card:hover{border-color:var(--green-dim)}
+.role-icon{width:44px;height:44px;border:1px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;border-radius:4px}
+.ri-admin{border-color:#00aaff44;color:var(--blue)}.ri-nav{border-color:#00ff8844;color:var(--green)}
+.role-title{font-size:15px;font-weight:700;letter-spacing:1px;color:var(--text)}
+.role-desc{font-size:12px;color:var(--text3);margin-top:2px}
+#screen-loading{position:fixed;inset:0;background:var(--bg);z-index:500;display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px}
+#screen-loading.active{display:flex}
+.loading-spinner{width:40px;height:40px;border:2px solid var(--border2);border-top-color:var(--green);border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.pin-screen{text-align:center;padding:.5rem 0}
+.pin-dots{display:flex;justify-content:center;gap:14px;margin:1.25rem 0}
+.pin-dot{width:16px;height:16px;border-radius:50%;border:1px solid var(--border2);background:transparent;transition:all .15s}
+.pin-dot.filled{background:var(--green);border-color:var(--green);box-shadow:0 0 8px var(--green)}
+.pin-pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:240px;margin:0 auto}
+.pin-key{padding:14px;border:1px solid var(--border2);background:var(--bg3);font-size:18px;font-weight:600;cursor:pointer;font-family:var(--font-mono);color:var(--text);border-radius:4px;transition:all .15s}
+.pin-key:hover{border-color:var(--green-dim);color:var(--green);background:var(--green-dark)}
+.pin-key:active{transform:scale(.95)}.pin-key.del{font-size:12px;color:var(--text3);font-family:var(--font-ui)}
+.pin-err{color:var(--red);font-family:var(--font-mono);font-size:11px;margin-top:10px;min-height:16px}
+.pos-select-grid{display:flex;flex-direction:column;gap:8px;margin-top:1rem}
+.pos-sel-btn{background:var(--bg2);border:1px solid var(--border2);border-radius:4px;padding:.9rem 1.1rem;cursor:pointer;display:flex;align-items:center;gap:12px;transition:all .2s;font-family:var(--font-ui);text-align:left;color:var(--text)}
+.pos-sel-btn:hover{border-color:var(--green-dim);background:var(--bg3)}
+input,select{width:100%;padding:9px 12px;border:1px solid var(--border2);border-radius:4px;font-family:var(--font-mono);font-size:13px;background:var(--bg3);color:var(--text);outline:none;transition:border-color .15s}
+input:focus,select:focus{border-color:var(--green-dim);box-shadow:0 0 0 2px var(--green-glow)}
+input::placeholder{color:var(--text3)}
+.deck-big-input{font-size:24px;font-weight:600;text-align:center;letter-spacing:4px;padding:14px}.deck-big-input:focus{border-color:var(--green)}
+.btn{padding:8px 16px;border:1px solid var(--border2);border-radius:4px;font-family:var(--font-ui);font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;cursor:pointer;background:transparent;color:var(--text2);display:inline-flex;align-items:center;gap:6px;transition:all .15s}
+.btn:hover{border-color:var(--green-dim);color:var(--green);background:var(--green-dark)}
+.btn-primary{background:var(--green-dark);border-color:var(--green-dim);color:var(--green);width:100%;justify-content:center;padding:12px}.btn-primary:hover{background:rgba(0,255,136,.25)}
+.btn-blue{border-color:#00aaff55;color:var(--blue);background:rgba(0,170,255,.05)}.btn-blue:hover{background:rgba(0,170,255,.15);border-color:var(--blue)}
+.btn-red{border-color:#ff444455;color:var(--red)}.btn-red:hover{background:rgba(255,68,68,.1)}
+.btn-amber{border-color:#ffb80055;color:var(--amber)}.btn-amber:hover{background:rgba(255,184,0,.12)}
+.btn-sm{padding:5px 10px;font-size:11px}.btn-full{width:100%;justify-content:center}
+.back-btn{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border:1px solid var(--border2);border-radius:4px;background:transparent;cursor:pointer;font-size:11px;font-family:var(--font-ui);font-weight:600;color:var(--text3);margin-bottom:1rem;text-transform:uppercase;transition:all .15s;letter-spacing:.5px}
+.back-btn:hover{color:var(--text);border-color:var(--border3)}
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:2px 8px;border-radius:2px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;font-family:var(--font-ui)}
+.badge-green{background:rgba(0,255,136,.1);color:var(--green);border:1px solid rgba(0,255,136,.3)}
+.badge-amber{background:rgba(255,184,0,.1);color:var(--amber);border:1px solid rgba(255,184,0,.3)}
+.badge-blue{background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3)}
+.badge-gray{background:rgba(255,255,255,.05);color:var(--text3);border:1px solid var(--border2)}
+.pos-list{display:flex;flex-direction:column;gap:8px;margin-bottom:1.25rem}
+.pos-card{background:var(--bg2);border:1px solid var(--border2);border-radius:4px;padding:.9rem 1.1rem;transition:all .2s;display:flex;align-items:center;gap:12px}
+.pos-card.available{cursor:pointer}.pos-card.available:hover{border-color:var(--green-dim);background:var(--bg3)}
+.pos-card.sel{border-color:var(--green);background:var(--green-dark)}
+.pos-card.locked{opacity:.5;cursor:not-allowed}.pos-card.done-card{opacity:.6;cursor:not-allowed}
+.pos-num{width:34px;height:34px;border:1px solid var(--border2);display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:12px;font-weight:600;flex-shrink:0;border-radius:3px}
+.pn1{border-color:#00aaff44;color:var(--blue)}.pn2{border-color:#ffb80044;color:var(--amber)}.pn3{border-color:#00ff8844;color:var(--green)}.pn4{border-color:#ff886644;color:#ff8866}.pn5{border-color:#aa88ff44;color:#aa88ff}
+.pos-body{flex:1;min-width:0}.pos-name{font-size:13px;font-weight:700;letter-spacing:.5px;color:var(--text)}
+.pos-mission{font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pos-right{text-align:right;flex-shrink:0}.wait-tag{font-size:12px;font-weight:700;font-family:var(--font-mono)}
+.wt-green{color:var(--green)}.wt-amber{color:var(--amber)}.wt-red{color:var(--red)}
+.qbar{height:3px;border-radius:2px;background:var(--border2);margin-top:5px;overflow:hidden;width:70px;margin-left:auto}
+.qfill{height:100%;border-radius:2px}.qf-green{background:var(--green)}.qf-amber{background:var(--amber)}.qf-red{background:var(--red)}
+.confirm-box{background:var(--bg3);border:1px solid var(--border3);border-radius:4px;padding:1.5rem;text-align:center;margin-bottom:1rem}
+.q-item{background:var(--bg3);border:1px solid var(--border2);border-radius:4px;padding:10px 12px;display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.q-item.called{border-color:rgba(255,184,0,.4);background:rgba(255,184,0,.05)}
+.qnum{width:28px;height:28px;border:1px solid var(--border2);display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:11px;font-weight:600;flex-shrink:0;border-radius:3px;color:var(--text3)}
+.qi-info{flex:1}.qi-name{font-size:13px;font-weight:700;color:var(--text)}.qi-sub{font-size:11px;color:var(--text3);margin-top:2px;display:flex;align-items:center;gap:6px}
+.timer-display{font-family:var(--font-mono);font-size:22px;font-weight:600;color:var(--green);text-shadow:0 0 12px rgba(0,255,136,.5);letter-spacing:2px}
+.timer-display.warning{color:var(--amber);text-shadow:0 0 12px rgba(255,184,0,.5)}
+.timer-display.danger{color:var(--red);text-shadow:0 0 12px rgba(255,68,68,.5);animation:blink .5s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+.timer-bar{height:4px;border-radius:2px;background:var(--border2);margin-top:6px;overflow:hidden}
+.timer-fill{height:100%;border-radius:2px;transition:width 1s linear}
+.tf-green{background:var(--green)}.tf-amber{background:var(--amber)}.tf-red{background:var(--red)}
+.ticket{border:1px solid var(--border3);border-radius:4px;padding:1.5rem;text-align:center;background:var(--bg3);position:relative;overflow:hidden}
+.ticket::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.tt1::before{background:var(--blue)}.tt2::before{background:var(--amber)}.tt3::before{background:var(--green)}.tt4::before{background:#ff8866}.tt5::before{background:#aa88ff}
+.ticket-pos-name{font-size:10px;letter-spacing:2px;color:var(--text3);font-family:var(--font-mono);text-transform:uppercase}
+.ticket-station-id{font-family:var(--font-mono);font-size:28px;font-weight:600;color:var(--green);letter-spacing:3px;text-shadow:0 0 16px rgba(0,255,136,.35);margin-bottom:4px}
+.ticket-mission{font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:2px}
+.ticket-num{font-family:var(--font-mono);font-size:52px;font-weight:600;line-height:1;margin:10px 0 6px;color:var(--green);text-shadow:0 0 20px rgba(0,255,136,.4)}
+.ticket-deck{font-family:var(--font-mono);font-size:38px;font-weight:600;letter-spacing:4px;color:var(--green);text-shadow:0 0 20px rgba(0,255,136,.4)}
+.ticket-main-name{font-family:var(--font-ui);font-size:22px;font-weight:700;letter-spacing:1px;color:var(--text);margin:8px 0 4px;line-height:1.2}
+.ticket-deck-small{font-family:var(--font-mono);font-size:13px;color:var(--text3);margin-top:4px;letter-spacing:2px}
+.ticket-stats{display:flex;justify-content:center;gap:28px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border2)}
+.tstat-val{font-family:var(--font-mono);font-size:20px;font-weight:600;color:var(--text)}.tstat-lbl{font-size:10px;color:var(--text3);letter-spacing:.5px;margin-top:2px;font-weight:600;text-transform:uppercase}
+.ticket-countdown{margin-top:10px;padding:8px;background:var(--bg2);border-radius:3px;border:1px solid var(--border2)}
+.est-card{background:var(--bg2);border:1px solid var(--border2);border-radius:4px;padding:.9rem 1.1rem;display:flex;align-items:center;gap:12px;margin-bottom:8px}
+.notif-panel{position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:200;width:min(400px,95vw);pointer-events:none}
+.notif{background:var(--bg2);border:1px solid var(--green);border-radius:4px;padding:12px 16px;margin-top:8px;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--green);font-weight:600;pointer-events:auto;animation:notifIn .3s ease;box-shadow:0 0 20px rgba(0,255,136,.2)}
+.notif.warning{border-color:var(--amber);color:var(--amber)}.notif.urgent{border-color:var(--red);color:var(--red);animation:notifIn .3s ease,urgentPulse 1s infinite}
+@keyframes notifIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes urgentPulse{0%,100%{box-shadow:0 0 20px rgba(255,68,68,.2)}50%{box-shadow:0 0 35px rgba(255,68,68,.5)}}
+.notif-close{margin-left:auto;cursor:pointer;opacity:.6;font-size:14px;flex-shrink:0}.notif-close:hover{opacity:1}
+.apos-tab{padding:8px 10px;border:1px solid var(--border2);background:transparent;cursor:pointer;font-size:11px;font-family:var(--font-ui);font-weight:600;letter-spacing:.5px;text-align:left;display:flex;align-items:center;gap:8px;width:100%;margin-bottom:4px;color:var(--text3);text-transform:uppercase;border-radius:3px;transition:all .15s}
+.apos-tab:hover{color:var(--text2);border-color:var(--border3)}.apos-tab.active{background:var(--green-dark);border-color:var(--green-dim);color:var(--green)}
+.apos-num{width:20px;height:20px;border:1px solid var(--border2);font-family:var(--font-mono);font-size:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0;border-radius:2px}
+.dur-btn{width:26px;height:26px;border:1px solid var(--border2);background:var(--bg3);cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;color:var(--text);font-family:var(--font-mono);border-radius:3px;transition:all .15s}
+.dur-btn:hover{border-color:var(--green-dim);color:var(--green)}
+.add-deck-row{display:flex;gap:8px;margin-bottom:10px}.add-deck-row input{flex:1}
+.scan-area{background:var(--bg3);border:1px solid var(--border2);border-radius:4px;padding:1.5rem;text-align:center;margin-bottom:1rem}
+video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;border:1px solid var(--border2)}
+
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem;padding-bottom:10px;border-bottom:1px solid var(--border2)}
+.rb{font-size:10px;padding:3px 10px;border-radius:2px;font-weight:700;letter-spacing:1px;text-transform:uppercase;font-family:var(--font-ui)}
+.rb-admin{background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3)}
+.rb-nav{background:var(--green-dark);color:var(--green);border:1px solid rgba(0,255,136,.3)}
+.empty-state{text-align:center;padding:2rem 0;color:var(--text3);font-family:var(--font-mono);font-size:12px}
+.empty-state i{font-size:32px;display:block;margin-bottom:10px;opacity:.3}
+.save-dot{width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block;margin-right:4px;vertical-align:middle;box-shadow:0 0 4px var(--green)}
+.dash-card{background:var(--bg3);border:1px solid var(--border2);border-radius:4px;padding:12px;text-align:center}
+.dash-val{font-family:var(--font-mono);font-size:26px;font-weight:600;line-height:1}
+.dash-lbl{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-top:4px}
+.banner-success{background:rgba(0,255,136,.08);border:1px solid rgba(0,255,136,.3);border-radius:4px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--green);font-weight:600}
+.banner-warn{background:rgba(255,184,0,.08);border:1px solid rgba(255,184,0,.3);border-radius:4px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--amber);font-weight:600}
+@keyframes slotPulse{0%,100%{opacity:1}50%{opacity:.5}}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+<div class="notif-panel" id="notif-panel"></div>
+<div id="screen-loading"><div class="loading-spinner"></div><div id="loading-msg" style="font-family:var(--font-mono);font-size:12px;color:var(--green);letter-spacing:2px">CONNECTING...</div></div>
+<div class="app">
+<div class="sys-header">
+  <div class="sys-logo">IMMERSIVE CRUISE <span>// QUEUE SYSTEM</span></div>
+  <div class="sys-status"><div class="pulse-dot"></div><span id="sys-time">--:--:--</span></div>
+</div>
+
+<div id="screen-role" class="screen">
+  <div class="section-label">Select access level</div>
+  <div class="role-card" onclick="startLogin('admin')"><div class="role-icon ri-admin"><i class="ti ti-shield-lock"></i></div><div><div class="role-title">Admin</div><div class="role-desc" style="font-family:var(--font-mono)">Manage queues · Start timers · PIN required</div></div><i class="ti ti-chevron-right" style="margin-left:auto;color:var(--text3)"></i></div>
+  <div class="role-card" onclick="startLogin('navigator')"><div class="role-icon ri-nav"><i class="ti ti-compass"></i></div><div><div class="role-title">Navigator</div><div class="role-desc" style="font-family:var(--font-mono)">Reserve queue slots · Track your missions</div></div><i class="ti ti-chevron-right" style="margin-left:auto;color:var(--text3)"></i></div>
+</div>
+
+<div id="screen-pin" class="screen">
+  <button class="back-btn" onclick="showScreen('screen-role')"><i class="ti ti-arrow-left"></i> Back</button>
+  <div class="pin-screen">
+    <div style="font-size:28px;color:var(--blue)"><i class="ti ti-shield-lock"></i></div>
+    <div style="font-size:16px;font-weight:700;letter-spacing:2px;margin-top:8px;color:var(--text)">ADMIN ACCESS</div>
+    <div style="font-family:var(--font-mono);font-size:11px;color:var(--text3);margin-top:4px">Enter 4-digit PIN</div>
+    <div class="pin-dots" id="pin-dots"><div class="pin-dot" id="pd0"></div><div class="pin-dot" id="pd1"></div><div class="pin-dot" id="pd2"></div><div class="pin-dot" id="pd3"></div></div>
+    <div id="pin-pad-wrap">
+      <div class="pin-pad">
+        <button class="pin-key" onclick="pinPress('1')">1</button><button class="pin-key" onclick="pinPress('2')">2</button><button class="pin-key" onclick="pinPress('3')">3</button>
+        <button class="pin-key" onclick="pinPress('4')">4</button><button class="pin-key" onclick="pinPress('5')">5</button><button class="pin-key" onclick="pinPress('6')">6</button>
+        <button class="pin-key" onclick="pinPress('7')">7</button><button class="pin-key" onclick="pinPress('8')">8</button><button class="pin-key" onclick="pinPress('9')">9</button>
+        <button class="pin-key del" onclick="pinClear()" style="grid-column:1">CLEAR</button><button class="pin-key" onclick="pinPress('0')">0</button><button class="pin-key del" onclick="pinDel()"><i class="ti ti-backspace"></i></button>
+      </div>
+      <div class="pin-err" id="pin-err" style="font-family:var(--font-mono)"></div>
+    </div>
+    <div id="admin-pos-select" style="display:none">
+      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text3);margin-bottom:12px;letter-spacing:1px">SELECT YOUR STATION</div>
+      <div class="pos-select-grid">
+        <button class="pos-sel-btn" onclick="selectAdminPos(1)"><div class="pos-num pn1" style="flex-shrink:0">S1</div><div><div style="font-size:13px;font-weight:700">Terminal Circuit Recovery</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">Fixing the Corrupted Server</div></div></button>
+        <button class="pos-sel-btn" onclick="selectAdminPos(2)"><div class="pos-num pn2" style="flex-shrink:0">S2</div><div><div style="font-size:13px;font-weight:700">Emergency Power Grid</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">Stabilizing the Energy Tower</div></div></button>
+        <button class="pos-sel-btn" onclick="selectAdminPos(3)"><div class="pos-num pn3" style="flex-shrink:0">S3</div><div><div style="font-size:13px;font-weight:700">Central Database Hub</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">Injecting the Security Path</div></div></button>
+        <button class="pos-sel-btn" onclick="selectAdminPos(4)"><div class="pos-num pn4" style="flex-shrink:0">S4</div><div><div style="font-size:13px;font-weight:700">Fuel & Hydraulic Bay</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">Reconstructing the Fuel Line</div></div></button>
+        <button class="pos-sel-btn" onclick="selectAdminPos(5)"><div class="pos-num pn5" style="flex-shrink:0">S5</div><div><div style="font-size:13px;font-weight:700">Signal Transmission Room</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">Reconstructing the Authorization Script</div></div></button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="screen-deck" class="screen">
+  <button class="back-btn" onclick="showScreen('screen-role')"><i class="ti ti-arrow-left"></i> Back</button>
+  <div style="text-align:center;margin-bottom:1.5rem">
+    <div style="font-size:32px;color:var(--green)"><i class="ti ti-compass"></i></div>
+    <div style="font-size:16px;font-weight:700;letter-spacing:2px;margin-top:8px;text-transform:uppercase">Navigator Access</div>
+    <div style="font-family:var(--font-mono);font-size:11px;color:var(--text3);margin-top:4px">Enter your deck number</div>
+  </div>
+  <input id="nav-deck-input" class="deck-big-input" placeholder="00" maxlength="6" onkeydown="if(event.key==='Enter') navDeckConfirm()" style="margin-bottom:8px"/>
+  <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);text-align:center;margin-bottom:8px">Your deck number will be used for all reservations</div>
+  <div id="nav-deck-err" style="font-family:var(--font-mono);font-size:11px;color:var(--red);text-align:center;min-height:18px;margin-bottom:8px"></div>
+  <button class="btn btn-primary" onclick="navDeckConfirm()"><i class="ti ti-arrow-right"></i> Initialize Navigator</button>
+</div>
+
+<div id="screen-nav" class="screen">
+  <div class="topbar">
+    <div style="display:flex;align-items:center;gap:8px"><span class="rb rb-nav"><i class="ti ti-compass"></i> Navigator</span><span id="nav-deck-label" style="font-family:var(--font-mono);font-size:13px;color:var(--green)"></span></div>
+    <button class="btn btn-sm" onclick="logout()"><i class="ti ti-logout"></i> Exit</button>
+  </div>
+  <div class="tab-bar">
+    <button class="tab active" onclick="navTab('reserve',this)"><i class="ti ti-plus-circle"></i> Reserve</button>
+    <button class="tab" onclick="navTab('tickets',this)"><i class="ti ti-ticket"></i> My Tickets</button>
+    <button class="tab" onclick="navTab('status',this)"><i class="ti ti-activity"></i> Live Status</button>
+  </div>
+  <div id="nav-view-reserve" class="view active">
+    <div id="nav-fairness-bar"></div><div id="nav-limit-banner"></div>
+    <div class="section-label">Select station</div>
+    <div class="pos-list" id="nav-pos-list"></div>
+    <div id="nav-app-confirm" style="display:none"></div>
+    <div id="nav-scan-confirm" style="display:none"></div>
+  </div>
+  <div id="nav-view-tickets" class="view">
+    <div id="nav-no-ticket" class="empty-state"><i class="ti ti-ticket"></i>No active reservations. Head to Reserve tab to join a queue.</div>
+    <div id="nav-ticket-area"></div>
+  </div>
+  <div id="nav-view-status" class="view">
+    <div class="section-label">Live station status</div>
+    <div id="nav-est-grid"></div>
+  </div>
+</div>
+
+<div id="screen-admin" class="screen">
+  <div class="topbar">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span class="rb rb-admin"><i class="ti ti-shield-lock"></i> Admin</span>
+      <span id="admin-pos-label" style="font-family:var(--font-mono);font-size:11px;color:var(--blue)"></span>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <span style="font-family:var(--font-mono);font-size:10px;color:var(--text3)"><span class="save-dot"></span>LIVE</span>
+      <button class="btn btn-sm" onclick="logout()"><i class="ti ti-logout"></i> Exit</button>
+    </div>
+  </div>
+  <div class="tab-bar" style="justify-content:space-between;align-items:flex-end">
+    <div style="display:flex;gap:4px">
+      <button class="tab" onclick="adminTab('dashboard',this)"><i class="ti ti-layout-dashboard"></i> Dashboard</button>
+      <button class="tab active" onclick="adminTab('queue',this)"><i class="ti ti-list-check"></i> Queue</button>
+    </div>
+    <button class="btn btn-sm btn-red" style="margin-bottom:1px" onclick="confirmReset()"><i class="ti ti-trash"></i> Reset All</button>
+  </div>
+  <div id="admin-view-dashboard" class="view">
+    <div id="admin-dashboard-content"></div>
+  </div>
+  <div id="admin-view-queue" class="view active">
+    <div style="display:grid;grid-template-columns:160px 1fr;gap:14px;align-items:start">
+      <div id="admin-sidebar"></div>
+      <div id="admin-content"></div>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<!-- RESET CONFIRM MODAL -->
+<div id="reset-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:300;align-items:center;justify-content:center">
+  <div style="background:var(--bg2);border:1px solid var(--red);border-radius:4px;padding:2rem;max-width:360px;width:90%;text-align:center">
+    <div style="font-size:32px;color:var(--red);margin-bottom:12px"><i class="ti ti-alert-triangle"></i></div>
+    <div style="font-size:15px;font-weight:700;letter-spacing:1px;color:var(--text);margin-bottom:8px">RESET ALL DATA</div>
+    <div style="font-family:var(--font-mono);font-size:11px;color:var(--text3);margin-bottom:6px">This will permanently delete:</div>
+    <div style="font-family:var(--font-mono);font-size:11px;color:var(--red);margin-bottom:20px;line-height:1.8">
+      · All queues at all stations<br>
+      · All timers<br>
+      · All pass / fail results<br>
+      · All deck history
+    </div>
+    <div style="font-family:var(--font-mono);font-size:11px;color:var(--text3);margin-bottom:16px">Type <strong style="color:var(--red)">RESET</strong> to confirm</div>
+    <input id="reset-confirm-input" placeholder="Type RESET" style="text-align:center;font-size:14px;letter-spacing:2px;margin-bottom:12px;border-color:var(--red)" oninput="checkResetInput()" />
+    <div style="display:flex;gap:8px">
+      <button class="btn" style="flex:1;justify-content:center" onclick="closeReset()"><i class="ti ti-x"></i> Cancel</button>
+      <button id="reset-confirm-btn" class="btn btn-red btn-full" style="flex:1;opacity:.4;cursor:not-allowed" disabled onclick="doReset()"><i class="ti ti-trash"></i> Reset</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
