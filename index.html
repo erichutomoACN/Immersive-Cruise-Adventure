@@ -220,13 +220,13 @@ window.navDeckConfirm = async function(){
     renderFairnessBar();
     renderNavStatus();
     if(document.getElementById('nav-view-tickets').classList.contains('active')) renderTix();
-    if(document.getElementById('nav-view-reserve').classList.contains('active')) renderPosList();
+    if(document.getElementById('nav-view-book').classList.contains('active')) renderPosList();
   });
   fbOn('results', s => {
     cachedResults = s||{};
     renderFairnessBar();
     if(document.getElementById('nav-view-tickets').classList.contains('active')) renderTix();
-    if(document.getElementById('nav-view-reserve').classList.contains('active')) renderPosList();
+    if(document.getElementById('nav-view-book').classList.contains('active')) renderPosList();
   });
   if(!window._lastNotifTs) window._lastNotifTs = {};
   const lastNotifTs = window._lastNotifTs;
@@ -257,7 +257,7 @@ window.navDeckConfirm = async function(){
   renderPosList();
 
   const count = POS_DEFS.filter(def => toArr(getPosState(def.id).queue).some(i=>String(i.deck)===String(navDeck))).length;
-  if(count>0) showNotif(count+' active reservation(s) found for Deck '+navDeck,'success');
+  if(count>0) showNotif(count+' active booking(s) found for Deck '+navDeck,'success');
 };
 
 // ── RESULTS (Firebase only) ──
@@ -288,7 +288,7 @@ function getActiveDeckPos(){
   // Returns list of posIds where navDeck is currently in queue
   return POS_DEFS.map(def => def.id).filter(id => toArr(getPosState(id).queue).some(i=>String(i.deck)===String(navDeck)));
 }
-function canReserve(posId){
+function canBook(posId){
   const inQueue = toArr(getPosState(posId).queue).some(i=>String(i.deck)===String(navDeck));
   const res = getResultSync(navDeck, posId);
   if(res==='passed') return {ok:false,reason:'passed'};
@@ -301,7 +301,7 @@ function canReserve(posId){
 
 // ── REGISTER ──
 window.navConfirmRegister = async function(posId){
-  const chk = canReserve(posId);
+  const chk = canBook(posId);
   if(!chk.ok){ showNotif(chk.reason==='passed'?'Already passed':chk.reason==='already'?'Already in queue':'Slot limit reached. Finish or cancel one first.','warning'); return; }
   const ps = getPosState(posId);
   const def = POS_DEFS[posId-1];
@@ -316,7 +316,7 @@ window.navConfirmRegister = async function(posId){
   navTab('tickets', document.querySelectorAll('#screen-nav .tab')[1]);
 };
 
-window.cancelReservation = async function(posId){
+window.cancelBooking = async function(posId){
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
   const item = q.find(i=>String(i.deck)===String(navDeck));
@@ -327,7 +327,7 @@ window.cancelReservation = async function(posId){
     const rest = q.filter(i=>i.num!==item.num);
     if(rest.length>0) await fbUpdate('state/pos_'+posId+'/queue/'+rest[0].num, {status:'playing'});
   }
-  showNotif('Reservation cancelled','warning');
+  showNotif('Booking cancelled','warning');
 };
 
 // ── ADMIN ACTIONS ──
@@ -485,7 +485,7 @@ async function autoPair(posId){
     if(!a.pairedWith||a.pairedWith==='null') return;
     const partner = waitingQ.find(b=>String(b.deck)===String(a.pairedWith));
     if(partner && String(partner.pairedWith)===String(a.deck)){
-      // Valid mutual pair — preserve it
+      // Valid mutual pair — pbook it
       manualPairs.add(a.num);
       manualPairs.add(partner.num);
     }
@@ -733,8 +733,8 @@ function renderPosList(){
 function mkTag(icon,color,bg,border,label){ return `<span style="font-size:9px;padding:2px 8px;border-radius:2px;font-weight:700;text-transform:uppercase;background:${bg};color:${color};border:1px solid ${border}"><i class="ti ti-${icon}"></i> ${label}</span>`; }
 
 window.selPos = function(id){
-  const chk = canReserve(id);
-  if(!chk.ok){ showNotif('Cannot reserve this station','warning'); return; }
+  const chk = canBook(id);
+  if(!chk.ok){ showNotif('Cannot book this station','warning'); return; }
   document.querySelectorAll('#nav-pos-list .pos-card').forEach(c=>c.classList.remove('sel'));
   document.getElementById('npc-'+id)?.classList.add('sel');
   const area = document.getElementById('nav-app-confirm');
@@ -743,8 +743,8 @@ window.selPos = function(id){
 
 function confirmHTML(posId){
   const def=POS_DEFS[posId-1], ps=getPosState(posId), q=toArr(ps.queue), len=q.length, dur=ps.duration||8;
-  const chk=canReserve(posId);
-  if(!chk.ok) return `<div class="confirm-box" style="border-top:2px solid var(--red);border-color:rgba(255,68,68,.3)"><div style="font-size:28px;color:var(--red);margin-bottom:8px"><i class="ti ti-lock"></i></div><div style="font-size:14px;font-weight:700;color:var(--red)">Cannot Reserve</div><button class="btn btn-full" style="margin-top:16px;justify-content:center" onclick="navCancelConfirm()"><i class="ti ti-x"></i> Close</button></div>`;
+  const chk=canBook(posId);
+  if(!chk.ok) return `<div class="confirm-box" style="border-top:2px solid var(--red);border-color:rgba(255,68,68,.3)"><div style="font-size:28px;color:var(--red);margin-bottom:8px"><i class="ti ti-lock"></i></div><div style="font-size:14px;font-weight:700;color:var(--red)">Cannot Book</div><button class="btn btn-full" style="margin-top:16px;justify-content:center" onclick="navCancelConfirm()"><i class="ti ti-x"></i> Close</button></div>`;
   return `<div class="confirm-box" style="border-top:2px solid ${def.topColor};border-color:${def.topColor}44">
     <div style="font-family:var(--font-mono);font-size:10px;letter-spacing:2px;color:var(--text3)"><i class="ti ${def.icon}"></i> STATION ${posId}</div>
     <div style="font-size:14px;font-weight:700;margin:4px 0 2px;color:var(--text)">${def.name}</div>
@@ -755,7 +755,7 @@ function confirmHTML(posId){
     <div style="margin-top:6px;font-family:var(--font-mono);font-size:10px;color:var(--amber)"><i class="ti ti-info-circle"></i> Active slots after: ${getActiveDeckPos().length+1}/${MAX_ACTIVE}</div>
     <div style="display:flex;gap:8px;margin-top:16px">
       <button class="btn" style="flex:1;justify-content:center" onclick="navCancelConfirm()"><i class="ti ti-x"></i> Cancel</button>
-      <button class="btn btn-primary" style="flex:2;padding:10px" onclick="navConfirmRegister(${posId})"><i class="ti ti-check"></i> Confirm Reservation</button>
+      <button class="btn btn-primary" style="flex:2;padding:10px" onclick="navConfirmRegister(${posId})"><i class="ti ti-check"></i> Confirm Booking</button>
     </div></div>`;
 }
 
@@ -795,7 +795,7 @@ function renderTix(){
       : res==='failed'
       ? mkTag('x','#ff4444','rgba(255,68,68,.1)','rgba(255,68,68,.3)','Failed'+(resTs?' · '+fmtTs(resTs):''))
       : '';
-    const cancelBtn = inQueue?`<button onclick="cancelReservation(${def.id})" style="margin-left:auto;padding:4px 10px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:transparent;color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Cancel</button>`:'';
+    const cancelBtn = inQueue?`<button onclick="cancelBooking(${def.id})" style="margin-left:auto;padding:4px 10px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:transparent;color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Cancel</button>`:'';
     const isDuoActive = !!(ps.activeDuo && myIdx>=0 && myIdx<=1 && q[myIdx]&&q[myIdx].status==='playing');
     const duoPartner = (ps.activeDuo&&myIdx===0&&q.length>=2&&q[1]&&q[1].deck&&String(q[1].deck)!==String(navDeck))?String(q[1].deck):(ps.activeDuo&&myIdx===1&&q.length>=1&&q[0]&&q[0].deck&&String(q[0].deck)!==String(navDeck))?String(q[0].deck):null;
     const pairBadge = (ps.duoMode&&item.pairedWith&&item.pairedWith!=='null'&&item.pairedWith!=='undefined'&&myIdx>=0) ? `<span class="badge" style="background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3);font-size:10px"><i class="ti ti-users"></i> Paired w/ DECK ${item.pairedWith}</span>` : '';
@@ -1054,7 +1054,7 @@ window.navTab = function(name,btn){
   document.querySelectorAll('#screen-nav .view').forEach(v=>v.classList.remove('active'));
   if(btn) btn.classList.add('active');
   document.getElementById('nav-view-'+name).classList.add('active');
-  if(name==='reserve'){ renderFairnessBar(); renderPosList(); }
+  if(name==='book'){ renderFairnessBar(); renderPosList(); }
   if(name==='tickets') renderTix();
   if(name==='status') renderNavStatus();
 };
@@ -1200,7 +1200,7 @@ window.adminTab = function(name,btn){
   if(name==='dashboard') renderDashboard();
 };
 
-// ── RESERVE STEPS ──
+// ── BOOK STEPS ──
 function resetSteps(){
   const sc=document.getElementById('nav-scan-confirm'); if(sc) sc.style.display='none';
   const ac=document.getElementById('nav-app-confirm'); if(ac) ac.style.display='none';
@@ -1395,7 +1395,7 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
 <div id="screen-role" class="screen">
   <div class="section-label">Select access level</div>
   <div class="role-card" onclick="startLogin('admin')"><div class="role-icon ri-admin"><i class="ti ti-shield-lock"></i></div><div><div class="role-title">Admin</div><div class="role-desc" style="font-family:var(--font-mono)">Manage queues · Start timers · PIN required</div></div><i class="ti ti-chevron-right" style="margin-left:auto;color:var(--text3)"></i></div>
-  <div class="role-card" onclick="startLogin('navigator')"><div class="role-icon ri-nav"><i class="ti ti-compass"></i></div><div><div class="role-title">Navigator</div><div class="role-desc" style="font-family:var(--font-mono)">Reserve queue slots · Track your missions</div></div><i class="ti ti-chevron-right" style="margin-left:auto;color:var(--text3)"></i></div>
+  <div class="role-card" onclick="startLogin('navigator')"><div class="role-icon ri-nav"><i class="ti ti-compass"></i></div><div><div class="role-title">Navigator</div><div class="role-desc" style="font-family:var(--font-mono)">Book queue slots · Track your missions</div></div><i class="ti ti-chevron-right" style="margin-left:auto;color:var(--text3)"></i></div>
 </div>
 
 <div id="screen-pin" class="screen">
@@ -1435,7 +1435,7 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
     <div style="font-family:var(--font-mono);font-size:11px;color:var(--text3);margin-top:4px">Enter your deck number</div>
   </div>
   <input id="nav-deck-input" class="deck-big-input" placeholder="00" maxlength="6" onkeydown="if(event.key==='Enter') navDeckConfirm()" style="margin-bottom:8px"/>
-  <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);text-align:center;margin-bottom:8px">Your deck number will be used for all reservations</div>
+  <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);text-align:center;margin-bottom:8px">Your deck number will be used for all bookings</div>
   <div id="nav-deck-err" style="font-family:var(--font-mono);font-size:11px;color:var(--red);text-align:center;min-height:18px;margin-bottom:8px"></div>
   <button class="btn btn-primary" onclick="navDeckConfirm()"><i class="ti ti-arrow-right"></i> Initialize Navigator</button>
 </div>
@@ -1446,11 +1446,11 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
     <button class="btn btn-sm" onclick="logout()"><i class="ti ti-logout"></i> Exit</button>
   </div>
   <div class="tab-bar">
-    <button class="tab active" onclick="navTab('reserve',this)"><i class="ti ti-plus-circle"></i> Reserve</button>
+    <button class="tab active" onclick="navTab('book',this)"><i class="ti ti-plus-circle"></i> Book</button>
     <button class="tab" onclick="navTab('tickets',this)"><i class="ti ti-ticket"></i> My Tickets <span id="tickets-dot" style="width:7px;height:7px;border-radius:50%;background:var(--blue);margin-left:2px;vertical-align:middle;animation:pulse 2s infinite"></span></button>
     <button class="tab" onclick="navTab('status',this)"><i class="ti ti-activity"></i> Live Status</button>
   </div>
-  <div id="nav-view-reserve" class="view active">
+  <div id="nav-view-book" class="view active">
     <div id="nav-fairness-bar"></div><div id="nav-limit-banner"></div>
     <div class="section-label">Select station</div>
     <div class="pos-list" id="nav-pos-list"></div>
@@ -1458,7 +1458,7 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
     <div id="nav-scan-confirm" style="display:none"></div>
   </div>
   <div id="nav-view-tickets" class="view">
-    <div id="nav-no-ticket" class="empty-state"><i class="ti ti-ticket"></i>No active reservations. Head to Reserve tab to join a queue.</div>
+    <div id="nav-no-ticket" class="empty-state"><i class="ti ti-ticket"></i>No active bookings. Head to Book tab to join a queue.</div>
     <div id="nav-ticket-area"></div>
   </div>
   <div id="nav-view-status" class="view">
