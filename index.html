@@ -1229,22 +1229,6 @@ function renderAdminContent(){
 }
 
 // ── RENDER: ADMIN SIDEBAR ──
-function renderAdminSidebar(){
-  const el = document.getElementById('admin-sidebar'); if(!el) return;
-  el.innerHTML = POS_DEFS.map(function(def){
-    const ps = getPosState(def.id);
-    const q = toArr(ps.queue), len=q.length, isActive=def.id===adminPosId;
-    return '<button class="apos-tab'+(isActive?' active':'')+'" onclick="selectAdminPos('+def.id+')">'
-      +'<div class="apos-num" style="border-color:'+def.topColor+'44;color:'+def.topColor+'">S'+def.id+'</div>'
-      +'<div style="flex:1;min-width:0">'
-      +'<div style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+def.name+'</div>'
-      +'<div style="font-family:var(--font-mono);font-size:10px;opacity:.6">'+len+' · '+(ps.duration||8)+'m'+(ps.timerRunning?' ⏱':'')+'</div>'
-      +'</div>'
-      +(len>0?'<span style="background:'+(len<=2?'rgba(0,255,136,.1)':'rgba(255,68,68,.1)')+';color:'+(len<=2?'var(--green)':'var(--red)')+';font-size:10px;padding:1px 6px;border-radius:2px;font-family:var(--font-mono)">'+len+'</span>':'')
-      +'</button>';
-  }).join('');
-}
-
 // ── RENDER: DASHBOARD ──
 function renderDashboard(){
   const el = document.getElementById('admin-dashboard-content'); if(!el) return;
