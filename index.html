@@ -703,8 +703,44 @@ function renderFairnessBar(){
 }
 
 // ── RENDER: NAV POS LIST ──
+function getRecommendations(){
+  // Get pos not yet visited (no result, not in queue)
+  const notVisited = POS_DEFS.filter(def => {
+    const res = getResultSync(navDeck, def.id);
+    if(res==='passed') return false; // already passed
+    const ps = getPosState(def.id);
+    const q = toArr(ps.queue);
+    if(q.some(i=>String(i.deck)===String(navDeck))) return false; // already in queue
+    return true;
+  });
+
+  if(!notVisited.length) return [];
+
+  // Score each pos: lower is better
+  // Score = (waiting slots) × duration + (failed penalty)
+  const scored = notVisited.map(def => {
+    const ps = getPosState(def.id);
+    const q = toArr(ps.queue);
+    const dur = ps.duration||8;
+    const activeCount = q.filter(i=>['playing','expired'].includes(i.status)).length;
+    const waitingCount = q.filter(i=>!['playing','expired'].includes(i.status)).length;
+    const slots = ps.duoMode ? Math.ceil(waitingCount/2) : waitingCount;
+    const estWait = slots * dur;
+    const failedPenalty = getResultSync(navDeck, def.id)==='failed' ? 5 : 0; // slight penalty for retry
+    const score = estWait + failedPenalty;
+    return {def, ps, score, estWait, waitingCount};
+  });
+
+  // Sort by score ascending
+  scored.sort((a,b) => a.score - b.score);
+
+  // Return top 2
+  return scored.slice(0,2).map(s=>s.def.id);
+}
+
 function renderPosList(){
   const el = document.getElementById('nav-pos-list'); if(!el) return;
+  const recIds = getRecommendations();
   el.innerHTML = POS_DEFS.map(def => {
     const ps = getPosState(def.id);
     const q = toArr(ps.queue);
@@ -717,7 +753,11 @@ function renderPosList(){
     else if(res==='failed'){ tag=mkTag('refresh','#ff4444','rgba(255,68,68,.1)','rgba(255,68,68,.3)','Failed — Retry'); }
     else if(inQueue){ tag=mkTag('clock','#ffb800','rgba(255,184,0,.1)','rgba(255,184,0,.3)','In queue'); cls='pos-card locked'; click=''; }
     else if(getActiveDeckPos().length>=MAX_ACTIVE){ tag=mkTag('lock','#ff4444','rgba(255,68,68,.1)','rgba(255,68,68,.3)','Slots full'); cls='pos-card locked'; click=''; }
-    return `<div class="${cls}" id="npc-${def.id}" ${click}>
+    const isRec = recIds.includes(def.id) && cls.includes('available');
+    const recBadge = isRec ? `<div style="display:flex;align-items:center;gap:4px;margin-top:4px"><span style="font-size:9px;padding:2px 8px;border-radius:2px;font-weight:700;text-transform:uppercase;background:rgba(255,184,0,.12);color:var(--amber);border:1px solid rgba(255,184,0,.4)">★ Recommended</span></div>` : '';
+    const cardStyle = isRec ? 'border-color:rgba(255,184,0,.3);' : '';
+    return `<div class="${cls}" id="npc-${def.id}" ${click} style="${cardStyle}">
+      ${isRec?`<div style="position:absolute;top:0;left:0;right:0;height:2px;background:var(--amber);border-radius:4px 4px 0 0"></div>`:''}
       <div class="pos-num ${def.pnClass}">S${def.id}</div>
       <div class="pos-body"><div class="pos-name">${def.name}</div>
         <div class="pos-mission">&gt; ${def.mission}</div>
@@ -727,6 +767,7 @@ function renderPosList(){
         <div class="wait-tag ${wc(len)}">${ws(len,dur,ps.duoMode)}</div>
         <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:3px">${len} queued</div>
         ${tag?`<div style="margin-top:4px">${tag}</div>`:''}
+        ${recBadge}
       </div></div>`;
   }).join('');
 }
@@ -1314,7 +1355,7 @@ input::placeholder{color:var(--text3)}
 .badge-blue{background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3)}
 .badge-gray{background:rgba(255,255,255,.05);color:var(--text3);border:1px solid var(--border2)}
 .pos-list{display:flex;flex-direction:column;gap:8px;margin-bottom:1.25rem}
-.pos-card{background:var(--bg2);border:1px solid var(--border2);border-radius:4px;padding:.9rem 1.1rem;transition:all .2s;display:flex;align-items:center;gap:12px}
+.pos-card{background:var(--bg2);border:1px solid var(--border2);border-radius:4px;padding:.9rem 1.1rem;transition:all .2s;display:flex;align-items:center;gap:12px;position:relative;overflow:hidden}
 .pos-card.available{cursor:pointer}.pos-card.available:hover{border-color:var(--green-dim);background:var(--bg3)}
 .pos-card.sel{border-color:var(--green);background:var(--green-dark)}
 .pos-card.locked{opacity:.5;cursor:not-allowed}.pos-card.done-card{opacity:.6;cursor:not-allowed}
