@@ -167,12 +167,15 @@ function startGlobalTick(){
       if(etB){ etB.style.width=pct+'%'; etB.className='timer-fill '+(etRem<=300?'tf-red':etRem<=900?'tf-amber':'tf-green'); }
       // Admin topbar mini timer
       const adminBar = document.getElementById('admin-event-bar');
-      if(adminBar){
-        adminBar.style.display='block';
-        adminBar.textContent='⏱ '+fmtET(etRem);
-        adminBar.style.color=etColor;
-        adminBar.style.borderColor=etRem<=300?'rgba(255,68,68,.4)':etRem<=900?'rgba(255,184,0,.4)':'var(--border2)';
-      }
+      if(adminBar){ adminBar.style.display='block'; adminBar.textContent='⏱ '+fmtET(etRem); adminBar.style.color=etColor; adminBar.style.borderColor=etRem<=300?'rgba(255,68,68,.4)':etRem<=900?'rgba(255,184,0,.4)':'var(--border2)'; }
+      // Nav topbar mini timer
+      const navBar = document.getElementById('nav-event-bar');
+      if(navBar){ navBar.style.display='block'; navBar.textContent='⏱ '+fmtET(etRem); navBar.style.color=etColor; navBar.style.borderColor=etRem<=300?'rgba(255,68,68,.4)':etRem<=900?'rgba(255,184,0,.4)':'var(--border2)'; }
+      // Nav banner smooth tick
+      const navEtD = document.getElementById('nav-et-display');
+      const navEtB = document.getElementById('nav-et-bar');
+      if(navEtD){ navEtD.textContent=fmtET(etRem); navEtD.style.color=etColor; }
+      if(navEtB){ navEtB.style.width=pct+'%'; navEtB.className='timer-fill '+(etRem<=300?'tf-red':etRem<=900?'tf-amber':'tf-green'); }
       // Auto-open logbook at 15 min
       if(etRem<=900&&etRem>895&&!et.logbookOpen){
         fbUpdate('eventTimer',{logbookOpen:true});
@@ -1661,7 +1664,8 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
 <div id="screen-nav" class="screen">
   <div class="topbar">
     <div style="display:flex;align-items:center;gap:8px"><span class="rb rb-nav"><i class="ti ti-compass"></i> Navigator</span><span id="nav-deck-label" style="font-family:var(--font-mono);font-size:13px;color:var(--green)"></span></div>
-    <button class="btn btn-sm" onclick="logout()"><i class="ti ti-logout"></i> Exit</button>
+    <button class="btn <div id="nav-event-bar" style="display:none;font-family:var(--font-mono);font-size:12px;font-weight:600;padding:3px 10px;border-radius:3px;border:1px solid var(--border2);color:var(--text3)"></div>
+    btn-sm" onclick="logout()"><i class="ti ti-logout"></i> Exit</button</button>
   </div>
   <div class="tab-bar">
     <button class="tab active" onclick="navTab('book',this)"><i class="ti ti-plus-circle"></i> Book</button>
