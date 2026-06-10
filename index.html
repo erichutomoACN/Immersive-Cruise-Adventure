@@ -380,7 +380,7 @@ window.navConfirmRegister = async function(posId){
   const num = (ps.nextNum||0)+1;
   const q = toArr(ps.queue);
   await fbUpdate('state/pos_'+posId, {nextNum:num});
-  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:navDeck,status:q.length===0?'playing':'waiting',method:'app'});
+  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:navDeck,status:'waiting',method:'app'});
   // Auto-pair if duo mode on
   await autoPair(posId); // autoPair no-ops if duoMode is off
   showNotif('Queue #'+String(num).padStart(2,'0')+' — '+def.name,'success');
@@ -395,9 +395,7 @@ window.cancelBooking = async function(posId){
   if(!item) return;
   await fbDel('state/pos_'+posId+'/queue/'+item.num);
   if(item.status==='playing'){
-    await fbUpdate('state/pos_'+posId, {timerRunning:false,timerEnd:null});
-    const rest = q.filter(i=>i.num!==item.num);
-    if(rest.length>0) await fbUpdate('state/pos_'+posId+'/queue/'+rest[0].num, {status:'playing'});
+    await fbUpdate('state/pos_'+posId, {timerRunning:false,timerEnd:null,activeDuo:false});
   }
   showNotif('Booking cancelled','warning');
 };
@@ -526,15 +524,26 @@ async function adminNext(posId, auto){
   if(wasDuo) await fbDel('state/pos_'+posId+'/queue/'+q[1].num);
   await fbUpdate('state/pos_'+posId, {timerRunning:false, timerEnd:null, activeDuo:false});
   const remaining = q.slice(wasDuo?2:1);
+  // Notify next groups they're up, but don't auto-set playing status
   if(remaining.length>0){
-    await fbUpdate('state/pos_'+posId+'/queue/'+remaining[0].num, {status:'playing'});
     chkQNotif(posId, remaining[0].deck);
     if(ps.duoMode && remaining.length>=2)
       chkQNotif(posId, remaining[1].deck);
   }
-  // Re-pair remaining queue after session ends
   if(remaining.length>=2) await autoPair(posId);
 }
+
+window.cancelReservation = async function(posId){
+  const ps = getPosState(posId);
+  const q = toArr(ps.queue);
+  const item = q.find(i=>String(i.deck)===String(navDeck));
+  if(!item) return;
+  await fbDel('state/pos_'+posId+'/queue/'+item.num);
+  if(['playing','expired','done'].includes(item.status)){
+    await fbUpdate('state/pos_'+posId, {timerRunning:false, timerEnd:null, activeDuo:false});
+  }
+  showNotif('Booking cancelled','warning');
+};
 
 window.adminAddDeck = async function(posId){
   const inp = document.getElementById('add-deck-'+posId);
@@ -544,7 +553,7 @@ window.adminAddDeck = async function(posId){
   const q = toArr(ps.queue);
   const num = (ps.nextNum||0)+1;
   await fbUpdate('state/pos_'+posId, {nextNum:num});
-  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:val,status:q.length===0?'playing':'waiting',method:'manual'});
+  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:val,status:'waiting',method:'manual'});
   await autoPair(posId); // autoPair no-ops if duoMode is off
   if(inp) inp.value='';
   showNotif('Deck '+val+' added','success');
@@ -556,10 +565,8 @@ window.adminRm = async function(posId, num){
   const item = q.find(i=>i.num===num);
   if(!item) return;
   await fbDel('state/pos_'+posId+'/queue/'+num);
-  if(item.status==='playing'){
-    await fbUpdate('state/pos_'+posId, {timerRunning:false,timerEnd:null});
-    const rest = q.filter(i=>i.num!==num);
-    if(rest.length>0) await fbUpdate('state/pos_'+posId+'/queue/'+rest[0].num, {status:'playing'});
+  if(['playing','expired','done'].includes(item.status)){
+    await fbUpdate('state/pos_'+posId, {timerRunning:false,timerEnd:null,activeDuo:false});
   }
 };
 
@@ -1150,8 +1157,12 @@ function renderAdminContent(){
   const selForPair = (_manualPairSelection[adminPosId]||[]);
   const playingOrExpiredStatuses = ['playing','expired','done'];
   // Show ALL non-playing decks in queue list (including q[0] who needs to be selected)
-  const waiting = q.filter(item => !playingOrExpiredStatuses.includes(item.status));
-  console.log('[DEBUG] adminPosId='+adminPosId+' q='+JSON.stringify(q.map(i=>({num:i.num,deck:i.deck,status:i.status})))+' waiting='+waiting.length);
+  // If timer not running, treat 'playing' status as 'waiting' (stale data)
+  const waiting = q.filter(item => {
+    if(['expired','done'].includes(item.status)) return false;
+    if(item.status==='playing' && ps.timerRunning) return false;
+    return true;
+  });
   const pairBtnHtml = ps.duoMode&&selForPair.length===2
     ? '<button class="btn btn-blue btn-sm" style="width:100%;justify-content:center;margin-bottom:8px" onclick="confirmManualPair('+adminPosId+')"><i class="ti ti-users"></i> Pair: DECK '+selForPair[0].deck+' + DECK '+selForPair[1].deck+'</button>'
     : ps.duoMode&&selForPair.length===1
