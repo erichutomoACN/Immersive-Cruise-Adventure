@@ -99,40 +99,6 @@ async function logout(){
 window.logout = logout;
 
 // ── INIT ──
-async function init(){
-  showLoading('Connecting...');
-  try {
-    const s = await fbGet('state');
-    if(!s){
-      // First time setup
-      const init = {};
-      POS_DEFS.forEach(p => { init['pos_'+p.id] = {duration:8,queue:{},timerRunning:false,timerEnd:null,nextNum:0,duoMode:false,activeDuo:false}; });
-      await fbSet('state', init);
-    } else {
-      // Migrate existing state — add missing fields without overwriting
-      const migUpdates = {};
-      POS_DEFS.forEach(p => {
-        const existing = s['pos_'+p.id] || {};
-        if(existing.duoMode === undefined) migUpdates['state/pos_'+p.id+'/duoMode'] = false;
-        if(existing.activeDuo === undefined) migUpdates['state/pos_'+p.id+'/activeDuo'] = false;
-      });
-      if(Object.keys(migUpdates).length) await update(ref(db), migUpdates);
-    }
-    fbState = (await fbGet('state')) || {};
-    window._eventTimer = (await fbGet('eventTimer')) || {};
-    hideLoading();
-    startGlobalTick();
-    // Auto-login navigator if deck param in URL
-    const urlDeck = new URL(window.location.href).searchParams.get('deck');
-    if(urlDeck){
-      document.getElementById('nav-deck-input').value = urlDeck;
-      await window.navDeckConfirm();
-    } else {
-      showScreen('screen-role');
-    }
-  } catch(e){ hideLoading(); showNotif('Connection error: '+e.message,'urgent'); showScreen('screen-role'); }
-}
-
 // ── GLOBAL TICK — updates timer displays every second ──
 function startGlobalTick(){
   setInterval(() => {
@@ -1183,7 +1149,9 @@ function renderAdminContent(){
 
   const selForPair = (_manualPairSelection[adminPosId]||[]);
   const playingOrExpiredStatuses = ['playing','expired','done'];
-  const waiting = q.filter((item,i) => !playingOrExpiredStatuses.includes(item.status) && i>=(ps.activeDuo?2:1));
+  // Show ALL non-playing decks in queue list (including q[0] who needs to be selected)
+  const waiting = q.filter(item => !playingOrExpiredStatuses.includes(item.status));
+  console.log('[DEBUG] adminPosId='+adminPosId+' q='+JSON.stringify(q.map(i=>({num:i.num,deck:i.deck,status:i.status})))+' waiting='+waiting.length);
   const pairBtnHtml = ps.duoMode&&selForPair.length===2
     ? '<button class="btn btn-blue btn-sm" style="width:100%;justify-content:center;margin-bottom:8px" onclick="confirmManualPair('+adminPosId+')"><i class="ti ti-users"></i> Pair: DECK '+selForPair[0].deck+' + DECK '+selForPair[1].deck+'</button>'
     : ps.duoMode&&selForPair.length===1
