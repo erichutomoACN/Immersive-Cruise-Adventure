@@ -673,11 +673,14 @@ let _manualPairSelection = {}; // {posId: [num1, num2]}
 window.togglePairSelect = function(posId, num, deck){
   if(!_manualPairSelection[posId]) _manualPairSelection[posId]=[];
   const sel = _manualPairSelection[posId];
+  const ps = getPosState(posId);
+  const maxSel = ps.duoMode ? 2 : 1;
   const idx = sel.findIndex(s=>s.num===num);
   if(idx>=0){ sel.splice(idx,1); } // deselect
-  else if(sel.length<2){ sel.push({num,deck}); } // select (max 2)
+  else if(sel.length<maxSel){ sel.push({num,deck}); } // select
+  else if(!ps.duoMode){ sel.splice(0,1,{num,deck}); } // solo: replace selection
   else { showNotif('Select only 2 decks to pair','warning'); return; }
-  renderAdminContent(); // refresh to show tick state
+  renderAdminContent();
 };
 window.confirmManualPair = async (posId) => {
   const sel = _manualPairSelection[posId]||[];
@@ -1162,6 +1165,8 @@ function renderAdminContent(){
     ? '<button class="btn btn-blue btn-sm" style="width:100%;justify-content:center;margin-bottom:8px" onclick="confirmManualPair('+adminPosId+')"><i class="ti ti-users"></i> Pair: DECK '+selForPair[0].deck+' + DECK '+selForPair[1].deck+'</button>'
     : ps.duoMode&&selForPair.length===1
     ? '<div style="font-family:var(--font-mono);font-size:10px;color:var(--blue);margin-bottom:6px"><i class="ti ti-check"></i> DECK '+selForPair[0].deck+' selected — pick one more to pair</div>'
+    : !ps.duoMode&&selForPair.length===1
+    ? '<div style="font-family:var(--font-mono);font-size:10px;color:var(--blue);margin-bottom:6px"><i class="ti ti-check"></i> DECK '+selForPair[0].deck+' selected — click Start to play</div>'
     : '';
   const waitHtml = waiting.length
     ? pairBtnHtml+'<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:6px">QUEUE ('+waiting.length+')</div>'
@@ -1171,7 +1176,7 @@ function renderAdminContent(){
         const isSelected = selForPair.some(s=>s.num===item.num);
         const partnerDeck = (item.pairedWith&&item.pairedWith!=='null'&&item.pairedWith!=='undefined') ? item.pairedWith : null;
         return '<div class="q-item" style="'+(isSelected?'border-color:var(--blue);background:rgba(0,170,255,.08)':'')+'">'
-          +(ps.duoMode?'<div onclick="togglePairSelect('+adminPosId+','+item.num+',\''+item.deck+'\')" style="width:20px;height:20px;border-radius:3px;border:1px solid '+(isSelected?'var(--blue)':'var(--border2)')+';background:'+(isSelected?'var(--blue)':'transparent')+';cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:white;font-size:12px;margin-right:2px">'+(isSelected?'✓':'')+'</div>':'')
+          +'<div onclick="togglePairSelect('+adminPosId+','+item.num+',\''+item.deck+'\')" style="width:20px;height:20px;border-radius:3px;border:1px solid '+(isSelected?'var(--blue)':'var(--border2)')+';background:'+(isSelected?'var(--blue)':'transparent')+';cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:white;font-size:12px;margin-right:2px">'+(isSelected?'✓':'')+'</div>'
           +'<div class="qnum">'+item.num+'</div>'
           +'<div class="qi-info"><div class="qi-name">DECK '+item.deck+'</div>'
           +'<div class="qi-sub">'+badge+(partnerDeck?' <span style="font-size:9px;padding:1px 6px;border-radius:2px;background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3)"><i class="ti ti-users"></i> w/ DECK '+partnerDeck+'</span>':'')+'</div></div>'
