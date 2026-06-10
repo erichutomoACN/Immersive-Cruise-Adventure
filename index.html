@@ -90,6 +90,10 @@ setInterval(() => {
 async function logout(){
   unsubscribers.forEach(u=>u()); unsubscribers=[];
   navDeck=''; adminPosId=null; pinVal=''; notifiedFlags={};
+  // Clear deck from URL
+  const logoutUrl = new URL(window.location.href);
+  logoutUrl.searchParams.delete('deck');
+  window.history.replaceState({}, '', logoutUrl);
   resetSteps(); showScreen('screen-role');
 }
 window.logout = logout;
@@ -115,8 +119,17 @@ async function init(){
       if(Object.keys(migUpdates).length) await update(ref(db), migUpdates);
     }
     fbState = (await fbGet('state')) || {};
-    hideLoading(); showScreen('screen-role');
+    window._eventTimer = (await fbGet('eventTimer')) || {};
+    hideLoading();
     startGlobalTick();
+    // Auto-login navigator if deck param in URL
+    const urlDeck = new URL(window.location.href).searchParams.get('deck');
+    if(urlDeck){
+      document.getElementById('nav-deck-input').value = urlDeck;
+      await window.navDeckConfirm();
+    } else {
+      showScreen('screen-role');
+    }
   } catch(e){ hideLoading(); showNotif('Connection error: '+e.message,'urgent'); showScreen('screen-role'); }
 }
 
@@ -138,8 +151,55 @@ function startGlobalTick(){
       if(navDeck) chkNotif(def.id, rem, total);
       if(rem<=0) doEndExpired(def.id);
     });
+
+    // Event timer tick
+    const et = window._eventTimer||{};
+    if(et.running && et.timerEnd){
+      const etRem = Math.max(0,Math.round((et.timerEnd-Date.now())/1000));
+      const etTotal = et.totalSecs||7200;
+      const pct = Math.round((etRem/etTotal)*100);
+      // Update admin event timer display if visible
+      const etD = document.getElementById('et-display');
+      const etB = document.getElementById('et-bar');
+      const fmtET = s=>{s=Math.max(0,s);return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
+      if(etD){ etD.textContent=fmtET(etRem); etD.style.color=etRem<=300?'var(--red)':etRem<=900?'var(--amber)':'var(--green)'; }
+      if(etB){ etB.style.width=pct+'%'; etB.className='timer-fill '+(etRem<=300?'tf-red':etRem<=900?'tf-amber':'tf-green'); }
+      // Navigator event banner
+      updateEventBanner(etRem, etTotal, et.logbookOpen||false);
+      // Auto-open logbook at 15 min
+      if(etRem<=900&&etRem>895&&!et.logbookOpen){
+        fbUpdate('eventTimer',{logbookOpen:true});
+      }
+      if(etRem<=0&&et.running){ fbUpdate('eventTimer',{running:false}); }
+    }
   }, 1000);
 }
+function updateEventBanner(remSecs, totalSecs, logbookOpen){
+  const banner = document.getElementById('nav-event-banner');
+  if(!banner) return;
+  if(remSecs<=0){
+    banner.style.display='block';
+    banner.innerHTML='<div style="background:rgba(255,68,68,.1);border:1px solid rgba(255,68,68,.4);border-radius:4px;padding:10px 14px;display:flex;align-items:center;gap:10px"><i class="ti ti-flag" style="color:var(--red);font-size:18px;flex-shrink:0"></i><div><div style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:var(--red)">MISSION ENDED</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:2px">Thank you for participating!</div></div></div>';
+    return;
+  }
+  const pct = Math.round((remSecs/totalSecs)*100);
+  const fmtET = s=>{s=Math.max(0,s);return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
+  const isRed = remSecs<=300;
+  const isAmber = remSecs<=900&&remSecs>300;
+  const color = isRed?'var(--red)':isAmber?'var(--amber)':'var(--green)';
+  const barCls = isRed?'tf-red':isAmber?'tf-amber':'tf-green';
+  banner.style.display='block';
+  const logbookBanner = (logbookOpen||remSecs<=900)?`<div style="background:rgba(255,184,0,.1);border:1px solid rgba(255,184,0,.35);border-radius:4px;padding:8px 12px;margin-top:8px;display:flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:11px;color:var(--amber);font-weight:600"><i class="ti ti-book" style="font-size:16px;flex-shrink:0"></i> Logbook submission is open</div>`:'';
+  banner.innerHTML=`<div style="background:var(--bg2);border:1px solid ${isRed?'rgba(255,68,68,.4)':isAmber?'rgba(255,184,0,.3)':'var(--border2)'};border-radius:4px;padding:10px 14px;margin-bottom:10px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <span style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px"><i class="ti ti-clock"></i> EVENT ENDS IN</span>
+      <span id="nav-et-display" style="font-family:var(--font-mono);font-size:16px;font-weight:600;color:${color}">${fmtET(remSecs)}</span>
+    </div>
+    <div class="timer-bar"><div id="nav-et-bar" class="timer-fill ${barCls}" style="width:${pct}%"></div></div>
+    ${logbookBanner}
+  </div>`;
+}
+
 function updateTimerEl(id, rem, total){
   const el = document.getElementById(id);
   if(el){ el.textContent=fmt(rem); el.className='timer-display'+(rem<=30?' danger':rem<=total*.3?' warning':''); }
@@ -199,6 +259,10 @@ window.selectAdminPos = async function(posId){
     renderAdminContent();
     if(document.getElementById('admin-view-dashboard').classList.contains('active')) debounceDashboard();
   });
+  fbOn('eventTimer', et => {
+    window._eventTimer = et||{};
+    if(document.getElementById('admin-view-event')?.classList.contains('active')) renderEventTimer();
+  });
 };
 
 // ── NAVIGATOR LOGIN ──
@@ -211,6 +275,10 @@ window.navDeckConfirm = async function(){
   hideLoading();
   document.getElementById('nav-deck-err').textContent='';
   document.getElementById('nav-deck-label').textContent = 'DECK '+navDeck;
+  // Save deck to URL so refresh auto-restores session
+  const url = new URL(window.location.href);
+  url.searchParams.set('deck', navDeck);
+  window.history.replaceState({}, '', url);
   resetSteps(); showScreen('screen-nav');
   unsubscribers.forEach(u=>u()); unsubscribers=[];
 
@@ -221,6 +289,17 @@ window.navDeckConfirm = async function(){
     renderNavStatus();
     if(document.getElementById('nav-view-tickets').classList.contains('active')) renderTix();
     if(document.getElementById('nav-view-book').classList.contains('active')) renderPosList();
+  });
+  fbOn('eventTimer', et => {
+    window._eventTimer = et||{};
+    const banner = document.getElementById('nav-event-banner');
+    if(!et||(!et.running&&!et.logbookOpen)){ if(banner) banner.style.display='none'; return; }
+    if(et.running&&et.timerEnd){
+      const remSecs = Math.max(0,Math.round((et.timerEnd-Date.now())/1000));
+      updateEventBanner(remSecs, et.totalSecs||7200, et.logbookOpen||false);
+    } else if(et.logbookOpen){
+      updateEventBanner(0, et.totalSecs||7200, true);
+    }
   });
   fbOn('results', s => {
     cachedResults = s||{};
@@ -1239,6 +1318,7 @@ window.adminTab = function(name,btn){
   if(btn) btn.classList.add('active');
   document.getElementById('admin-view-'+name).classList.add('active');
   if(name==='dashboard') renderDashboard();
+  if(name==='event') renderEventTimer();
 };
 
 // ── BOOK STEPS ──
@@ -1249,6 +1329,78 @@ function resetSteps(){
 }
 
 
+
+// ── EVENT TIMER ──
+function renderEventTimer(){
+  const el = document.getElementById('admin-event-content'); if(!el) return;
+  const et = fbState.eventTimer || {};
+  const running = et.running||false;
+  const remSecs = running&&et.timerEnd ? Math.max(0,Math.round((et.timerEnd-Date.now())/1000)) : (et.totalSecs||7200);
+  const totalSecs = et.totalSecs||7200;
+  const pct = totalSecs>0?Math.round((remSecs/totalSecs)*100):100;
+  const fmtET = s=>{s=Math.max(0,s);return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
+  const timerColor = remSecs<=300?'var(--red)':remSecs<=900?'var(--amber)':'var(--green)';
+  const barColor = remSecs<=300?'tf-red':remSecs<=900?'tf-amber':'tf-green';
+  const statusLabel = running?'<span style="font-size:10px;padding:3px 10px;border-radius:3px;background:rgba(0,255,136,.1);color:var(--green);border:1px solid rgba(0,255,136,.3)">RUNNING</span>':et.timerEnd&&remSecs<=0?'<span style="font-size:10px;padding:3px 10px;border-radius:3px;background:rgba(255,68,68,.1);color:var(--red);border:1px solid rgba(255,68,68,.3)">ENDED</span>':'<span style="font-size:10px;padding:3px 10px;border-radius:3px;background:rgba(255,255,255,.05);color:var(--text3);border:1px solid var(--border2)">IDLE</span>';
+
+  el.innerHTML = `
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:2px">EVENT COUNTDOWN</div>
+        ${statusLabel}
+      </div>
+      <div style="text-align:center;margin-bottom:16px">
+        <div id="et-display" style="font-family:var(--font-mono);font-size:56px;font-weight:600;letter-spacing:6px;line-height:1;color:${timerColor}">${fmtET(remSecs)}</div>
+        <div class="timer-bar" style="margin-top:12px"><div id="et-bar" class="timer-fill ${barColor}" style="width:${pct}%"></div></div>
+      </div>
+      <div style="background:var(--bg3);border-radius:4px;padding:12px 14px;margin-bottom:12px">
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-bottom:10px;letter-spacing:1px">SET DURATION</div>
+        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+          <button class="btn btn-sm" onclick="etSetPreset(120)"><i class="ti ti-clock"></i> 2 Hours</button>
+          <button class="btn btn-sm" style="color:var(--text3)">— or custom —</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input id="et-h" type="number" min="0" max="9" value="${Math.floor((et.totalSecs||7200)/3600)}" style="width:60px;text-align:center;padding:6px;font-family:var(--font-mono);font-size:14px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;color:var(--text)">
+          <span style="font-family:var(--font-mono);color:var(--text3)">h</span>
+          <input id="et-m" type="number" min="0" max="59" value="${Math.floor(((et.totalSecs||7200)%3600)/60)}" style="width:60px;text-align:center;padding:6px;font-family:var(--font-mono);font-size:14px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;color:var(--text)">
+          <span style="font-family:var(--font-mono);color:var(--text3)">m</span>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${!running?`<button class="btn btn-primary" style="flex:2" onclick="etStart()"><i class="ti ti-player-play"></i> Start Event Timer</button>`:`<button class="btn" style="flex:1;justify-content:center;border-color:rgba(255,184,0,.4);color:var(--amber)" onclick="etPause()"><i class="ti ti-player-pause"></i> Pause</button>`}
+        <button class="btn btn-red btn-sm" onclick="etReset()"><i class="ti ti-refresh"></i> Reset</button>
+      </div>
+      <div style="margin-top:10px;font-family:var(--font-mono);font-size:10px;color:var(--text3)">
+        <i class="ti ti-info-circle"></i> All navigators see this timer live · 15m left = logbook banner · 5m left = red alert
+      </div>
+    </div>`;
+}
+
+window.etSetPreset = function(mins){
+  const h=Math.floor(mins/60), m=mins%60;
+  const ih=document.getElementById('et-h'), im=document.getElementById('et-m');
+  if(ih) ih.value=h; if(im) im.value=m;
+};
+window.etStart = async function(){
+  const h=parseInt(document.getElementById('et-h')?.value)||0;
+  const m=parseInt(document.getElementById('et-m')?.value)||0;
+  const totalSecs=(h*60+m)*60;
+  if(totalSecs<=0){showNotif('Set a duration first','warning');return;}
+  const timerEnd=Date.now()+totalSecs*1000;
+  await fbSet('eventTimer',{running:true,timerEnd,totalSecs,logbookOpen:false});
+  showNotif('Event timer started — '+h+'h '+m+'m','success');
+};
+window.etPause = async function(){
+  const et=fbState.eventTimer||{};
+  if(!et.running) return;
+  const remSecs=Math.max(0,Math.round((et.timerEnd-Date.now())/1000));
+  await fbSet('eventTimer',{running:false,timerEnd:null,totalSecs:remSecs,logbookOpen:et.logbookOpen||false});
+  showNotif('Event timer paused','warning');
+};
+window.etReset = async function(){
+  await fbSet('eventTimer',{running:false,timerEnd:null,totalSecs:7200,logbookOpen:false});
+  showNotif('Event timer reset','warning');
+};
 
 // ── RESET ──
 window.confirmReset = function(){
@@ -1279,6 +1431,7 @@ window.doReset = async function(){
     updates['results']=null;
     updates['presence']=null;
     updates['notifications']=null;
+    await fbSet('eventTimer',{running:false,timerEnd:null,totalSecs:7200,logbookOpen:false});
     await update(ref(db), updates);
     hideLoading(); closeReset();
     showNotif('All data has been reset','success');
@@ -1523,11 +1676,15 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
     <div style="display:flex;gap:4px">
       <button class="tab" onclick="adminTab('dashboard',this)"><i class="ti ti-layout-dashboard"></i> Dashboard</button>
       <button class="tab active" onclick="adminTab('queue',this)"><i class="ti ti-list-check"></i> Queue</button>
+      <button class="tab" onclick="adminTab('event',this)"><i class="ti ti-clock"></i> Event Timer</button>
     </div>
     <button class="btn btn-sm btn-red" style="margin-bottom:1px" onclick="confirmReset()"><i class="ti ti-trash"></i> Reset All</button>
   </div>
   <div id="admin-view-dashboard" class="view">
     <div id="admin-dashboard-content"></div>
+  </div>
+  <div id="admin-view-event" class="view">
+    <div id="admin-event-content"></div>
   </div>
   <div id="admin-view-queue" class="view active">
     <div style="display:grid;grid-template-columns:160px 1fr;gap:14px;align-items:start">
