@@ -76,6 +76,11 @@ const getPosState = id => {
 
 // ── SCREENS ──
 const showScreen = id => { document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); document.getElementById(id)?.classList.add('active'); };
+const resetSteps = () => {
+  const confirm = document.getElementById('nav-app-confirm');
+  if(confirm) confirm.style.display='none';
+  document.querySelectorAll('#nav-pos-list .pos-card').forEach(c=>c.classList.remove('sel'));
+};
 window.showScreen = showScreen;
 const showLoading = msg => { document.getElementById('loading-msg').textContent = msg||'Loading...'; document.getElementById('screen-loading').classList.add('active'); };
 const hideLoading = () => document.getElementById('screen-loading').classList.remove('active');
@@ -192,15 +197,14 @@ let endingPos = {};
 async function doEndExpired(posId){
   if(endingPos[posId]) return;
   endingPos[posId] = true;
-  // Timer expired — stop timer but keep deck in queue for admin to set result
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
   if(!q.length){ delete endingPos[posId]; return; }
-  // Mark timer as stopped, status as expired — deck stays in queue
   await fbUpdate('state/pos_'+posId, {timerRunning:false, timerEnd:null});
-  await fbUpdate('state/pos_'+posId+'/queue/'+q[0].num, {status:'expired'});
-  if(ps.activeDuo && q.length>=2 && q[1] && q[1].status==='playing'){
-    await fbUpdate('state/pos_'+posId+'/queue/'+q[1].num, {status:'expired'});
+  // Mark ALL playing decks as expired
+  const playingNow = q.filter(i=>i.status==='playing');
+  for(const d of playingNow){
+    await fbUpdate('state/pos_'+posId+'/queue/'+d.num, {status:'expired'});
   }
   delete endingPos[posId];
 }
@@ -285,15 +289,6 @@ window.navDeckConfirm = async function(){
   });
   if(!window._lastNotifTs) window._lastNotifTs = {};
   const lastNotifTs = window._lastNotifTs;
-  fbOn('eventTimer', et => {
-    window._eventTimer = et||{};
-    const banner = document.getElementById('nav-event-banner');
-    if(!et||(!et.running&&!et.logbookOpen)){
-      if(banner) banner.style.display='none'; return;
-    }
-    const remSecs = et.running&&et.timerEnd ? Math.max(0,Math.round((et.timerEnd-Date.now())/1000)) : 0;
-    updateEventBanner(remSecs, et.totalSecs||7200, et.logbookOpen||false);
-  });
   fbOn('notifications', s => {
     if(!s||!navDeck) return;
     Object.values(s).forEach(n => {
@@ -404,37 +399,26 @@ window.cancelBooking = async function(posId){
 window.startTimerWithSelection = async function(posId){
   const sel = _manualPairSelection[posId]||[];
   if(!sel.length){ showNotif('Select at least one group first','warning'); return; }
-  const ps = getPosState(posId);
-  if(ps.timerRunning) return;
-
-  const timerEnd = Date.now()+(ps.duration||8)*60000;
-  const isDuo = ps.duoMode && sel.length>=2;
-
-  // Promote selected decks to front of queue by setting their sortKeys
-  // sel[0] gets sortKey=1, sel[1] gets sortKey=2, others shift back
-  const q = toArr(ps.queue);
-  const updates = {};
-
-  if(isDuo){
-    // Set sel[0] and sel[1] as first two
-    updates['state/pos_'+posId+'/queue/'+sel[0].num+'/sortKey'] = -2;
-    updates['state/pos_'+posId+'/queue/'+sel[1].num+'/sortKey'] = -1;
-  } else {
-    updates['state/pos_'+posId+'/queue/'+sel[0].num+'/sortKey'] = -1;
-  }
-  await update(ref(db), updates);
-  await new Promise(r=>setTimeout(r,300));
-
-  // Re-read fresh queue
+  // Read fresh state — local state may be stale
   const fresh = await fbGet('state/pos_'+posId);
-  const fq = Object.values(fresh.queue||{}).filter(i=>i&&i.deck&&i.num)
+  if(!fresh){ showNotif('Error reading state','urgent'); return; }
+  if(fresh.timerRunning){ showNotif('Session already running','warning'); return; }
+  const fq = Object.values(fresh.queue||{})
+    .filter(i=>i&&i.deck&&i.num)
     .sort((a,b)=>(a.sortKey||a.num)-(b.sortKey||b.num));
-
+  // Match by deck identifier (not num which can change)
+  const selDeckIds = sel.map(s=>String(s.deck));
+  const toPlay = fq.filter(i=>selDeckIds.includes(String(i.deck)) && i.status==='waiting');
+  if(!toPlay.length){
+    showNotif('Selected decks not in queue or already active','warning');
+    _manualPairSelection[posId]=[]; renderAdminContent(); return;
+  }
+  const timerEnd = Date.now()+(fresh.duration||8)*60000;
+  const isDuo = fresh.duoMode && toPlay.length>=2;
   await fbUpdate('state/pos_'+posId, {timerRunning:true, timerEnd, activeDuo:isDuo});
-  await fbUpdate('state/pos_'+posId+'/queue/'+fq[0].num, {status:'playing'});
-  if(isDuo && fq.length>=2) await fbUpdate('state/pos_'+posId+'/queue/'+fq[1].num, {status:'playing'});
-
-  // Clear selection
+  for(const d of toPlay.slice(0, isDuo?2:1)){
+    await fbUpdate('state/pos_'+posId+'/queue/'+d.num, {status:'playing'});
+  }
   _manualPairSelection[posId]=[];
   await autoPair(posId);
 };
@@ -481,36 +465,35 @@ window.startTimerSolo = async function(posId){
 };
 
 window.adminEndSession = async function(posId, result, deckNum){
-  // deckNum is optional — if provided, only end that specific deck (duo individual result)
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
   if(!q.length) return;
   const ts = Date.now();
-  const wasDuo = ps.activeDuo && q.length>=2 && q[1].status==='playing';
+  // Get only the decks currently in active session
+  const sessionDecks = q.filter(i=>['playing','expired','done'].includes(i.status));
 
   if(deckNum){
-    // Individual result for one deck in a duo — only advance when BOTH have results
+    // Individual result for one deck in duo
     await fbSet('results/'+String(deckNum)+'/pos_'+posId, {result, ts});
-    // Mark this deck as expired/done in queue (but keep in queue until partner is done)
     const thisItem = q.find(i=>String(i.deck)===String(deckNum));
     if(thisItem) await fbUpdate('state/pos_'+posId+'/queue/'+thisItem.num, {status:'done'});
     showNotif('Deck '+deckNum+' — '+result.toUpperCase(), result==='passed'?'success':'warning');
-    // Check if partner also has result
-    const playingQ = q.filter(i=>i.status==='playing'||i.status==='done'||i.status==='expired');
-    const otherItem = playingQ.find(i=>String(i.deck)!==String(deckNum));
+    // Check if partner (the other session deck) also has result
+    const otherItem = sessionDecks.find(i=>String(i.deck)!==String(deckNum));
     if(otherItem){
       const otherResult = await fbGet('results/'+String(otherItem.deck)+'/pos_'+posId);
-      if(otherResult) await adminNext(posId, false); // both done — advance
+      if(otherResult) await adminNext(posId, false);
       else showNotif('Waiting for result of Deck '+otherItem.deck,'warning');
     } else {
-      await adminNext(posId, false); // solo — advance immediately
+      await adminNext(posId, false);
     }
   } else {
-    // Same result for all active decks
-    await fbSet('results/'+q[0].deck+'/pos_'+posId, {result, ts});
-    if(wasDuo) await fbSet('results/'+q[1].deck+'/pos_'+posId, {result, ts});
+    // Same result for all session decks
+    for(const d of sessionDecks){
+      await fbSet('results/'+String(d.deck)+'/pos_'+posId, {result, ts});
+    }
     await adminNext(posId, false);
-    const names = wasDuo&&q[1] ? 'Deck '+(q[0].deck||'?')+' & '+(q[1].deck||'?') : 'Deck '+(q[0].deck||'?');
+    const names = sessionDecks.map(d=>'Deck '+d.deck).join(' & ');
     showNotif(names+' — '+result.toUpperCase(), result==='passed'?'success':'warning');
   }
 };
@@ -519,16 +502,17 @@ async function adminNext(posId, auto){
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
   if(!q.length) return;
-  const wasDuo = ps.activeDuo && q.length>=2 && q[1] && ['playing','expired','done'].includes(q[1].status);
-  await fbDel('state/pos_'+posId+'/queue/'+q[0].num);
-  if(wasDuo) await fbDel('state/pos_'+posId+'/queue/'+q[1].num);
+  // Remove ALL decks currently in session (playing/expired/done)
+  const sessionDecks = q.filter(i=>['playing','expired','done'].includes(i.status));
+  for(const d of sessionDecks){
+    await fbDel('state/pos_'+posId+'/queue/'+d.num);
+  }
   await fbUpdate('state/pos_'+posId, {timerRunning:false, timerEnd:null, activeDuo:false});
-  const remaining = q.slice(wasDuo?2:1);
-  // Notify next groups they're up, but don't auto-set playing status
+  // Remaining = decks not in session
+  const remaining = q.filter(i=>!['playing','expired','done'].includes(i.status));
   if(remaining.length>0){
     chkQNotif(posId, remaining[0].deck);
-    if(ps.duoMode && remaining.length>=2)
-      chkQNotif(posId, remaining[1].deck);
+    if(ps.duoMode && remaining.length>=2) chkQNotif(posId, remaining[1].deck);
   }
   if(remaining.length>=2) await autoPair(posId);
 }
@@ -629,7 +613,7 @@ async function autoPair(posId){
 
   // Auto-pair unpaired decks consecutively
   for(let i=0; i<unpaired.length-1; i+=2){
-    const a = waitingQ[i], b = waitingQ[i+1];
+    const a = unpaired[i], b = unpaired[i+1];
     if(a&&b){
       updates['state/pos_'+posId+'/queue/'+a.num+'/pairedWith'] = String(b.deck);
       updates['state/pos_'+posId+'/queue/'+b.num+'/pairedWith'] = String(a.deck);
@@ -663,13 +647,17 @@ async function clearAllPairs(posId){
 window.cancelPair = async (posId) => {
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
-  if(q.length<2) return;
-  const cancelledDeck = q[1].deck;
-  await fbUpdate('state/pos_'+posId+'/queue/'+q[1].num, {status:'waiting', pairedWith:null});
+  // Find the 2 playing decks
+  const playingDecks = q.filter(i=>i.status==='playing');
+  if(playingDecks.length<2){ showNotif('No duo session active','warning'); return; }
+  // Revert second playing deck back to waiting (keep first as playing)
+  const partner = playingDecks[1];
+  await fbUpdate('state/pos_'+posId+'/queue/'+partner.num, {status:'waiting', pairedWith:null});
+  // Also clear pairedWith for first deck
+  await fbUpdate('state/pos_'+posId+'/queue/'+playingDecks[0].num, {pairedWith:null});
   await fbUpdate('state/pos_'+posId, {activeDuo:false});
-  // Re-pair waiting decks so cancelled deck gets new partner
   await autoPair(posId);
-  showNotif('Pair cancelled — Deck '+cancelledDeck+' moved back to waiting','warning');
+  showNotif('Pair cancelled — Deck '+partner.deck+' moved back to waiting','warning');
 };
 
 // Manual pair: admin selects 2 specific decks to pair together (overrides auto)
@@ -1069,7 +1057,7 @@ function renderAdminContent(){
   const def=POS_DEFS[adminPosId-1], ps=getPosState(adminPosId), q=toArr(ps.queue), dur=ps.duration||8;
   const rem = ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
   const total = dur*60;
-  const isExpired = q.length>0 && (q[0].status==='expired' || (ps.activeDuo&&q.length>=2&&q[1]&&q[1].status==='expired'));
+  const isExpired = q.some(i=>i.status==='expired');
 
   let timerBlock='';
   // Get selected decks for manual start
@@ -1154,15 +1142,14 @@ function renderAdminContent(){
     }
   }
 
-  const selForPair = (_manualPairSelection[adminPosId]||[]);
+  const selForPair = selForStart; // same selection used for both pairing and starting
   const playingOrExpiredStatuses = ['playing','expired','done'];
   // Show ALL non-playing decks in queue list (including q[0] who needs to be selected)
-  // If timer not running, treat 'playing' status as 'waiting' (stale data)
-  const waiting = q.filter(item => {
-    if(['expired','done'].includes(item.status)) return false;
-    if(item.status==='playing' && ps.timerRunning) return false;
-    return true;
-  });
+  // Show all decks not currently in active session
+  const activeInSession = new Set(
+    q.filter(i=>['playing','expired','done'].includes(i.status)).map(i=>i.num)
+  );
+  const waiting = q.filter(item => !activeInSession.has(item.num));
   const pairBtnHtml = ps.duoMode&&selForPair.length===2
     ? '<button class="btn btn-blue btn-sm" style="width:100%;justify-content:center;margin-bottom:8px" onclick="confirmManualPair('+adminPosId+')"><i class="ti ti-users"></i> Pair: DECK '+selForPair[0].deck+' + DECK '+selForPair[1].deck+'</button>'
     : ps.duoMode&&selForPair.length===1
@@ -1610,6 +1597,7 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
     <div id="nav-event-bar" style="display:none;font-family:var(--font-mono);font-size:12px;font-weight:600;padding:3px 10px;border-radius:3px;border:1px solid var(--border2);color:var(--text3)"></div>
     <button class="btn btn-sm" onclick="logout()"><i class="ti ti-logout"></i> Exit</button>
   </div>
+  <div id="nav-event-banner" style="display:none;padding:0 1rem;margin-top:6px"></div>
   <div class="tab-bar">
     <button class="tab active" onclick="navTab('book',this)"><i class="ti ti-plus-circle"></i> Book</button>
     <button class="tab" onclick="navTab('tickets',this)"><i class="ti ti-ticket"></i> My Tickets <span id="tickets-dot" style="width:7px;height:7px;border-radius:50%;background:var(--blue);margin-left:2px;vertical-align:middle;animation:pulse 2s infinite"></span></button>
