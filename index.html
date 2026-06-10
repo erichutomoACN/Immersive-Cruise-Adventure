@@ -473,30 +473,43 @@ window.adminResetDeckResult = async function(posId, deckNum){
 };
 
 window.adminEndSession = async function(posId, result, deckNum){
-  const ps = getPosState(posId);
-  const q = toArr(ps.queue);
-  if(!q.length) return;
   const ts = Date.now();
-  // Get only the decks currently in active session
-  const sessionDecks = q.filter(i=>['playing','expired','done'].includes(i.status));
 
   if(deckNum){
     // Individual result for one deck in duo
+    // Read fresh state from Firebase to get accurate session info
+    const fresh = await fbGet('state/pos_'+posId);
+    if(!fresh) return;
+    const fq = Object.values(fresh.queue||{}).filter(i=>i&&i.deck&&i.num)
+      .sort((a,b)=>(a.sortKey||a.num)-(b.sortKey||b.num));
+    const sessionDecks = fq.filter(i=>['playing','expired','done'].includes(i.status));
+
+    // Save result and mark this deck as done
     await fbSet('results/'+String(deckNum)+'/pos_'+posId, {result, ts});
-    const thisItem = q.find(i=>String(i.deck)===String(deckNum));
+    const thisItem = fq.find(i=>String(i.deck)===String(deckNum));
     if(thisItem) await fbUpdate('state/pos_'+posId+'/queue/'+thisItem.num, {status:'done'});
     showNotif('Deck '+deckNum+' — '+result.toUpperCase(), result==='passed'?'success':'warning');
-    // Check if partner (the other session deck) also has result
-    const otherItem = sessionDecks.find(i=>String(i.deck)!==String(deckNum));
-    if(otherItem){
-      const otherResult = await fbGet('results/'+String(otherItem.deck)+'/pos_'+posId);
-      if(otherResult) await adminNext(posId, false);
-      else showNotif('Waiting for result of Deck '+otherItem.deck,'warning');
+
+    // Check if all session decks now have results
+    const otherDecks = sessionDecks.filter(i=>String(i.deck)!==String(deckNum));
+    if(otherDecks.length>0){
+      // Check each partner for result
+      let allDone = true;
+      for(const other of otherDecks){
+        const otherResult = await fbGet('results/'+String(other.deck)+'/pos_'+posId);
+        if(!otherResult){ allDone = false; showNotif('Waiting for result of Deck '+other.deck,'warning'); break; }
+      }
+      if(allDone) await adminNext(posId, false);
     } else {
+      // Solo session — advance immediately
       await adminNext(posId, false);
     }
   } else {
-    // Same result for all session decks
+    // Bulk result — read fresh state
+    const fresh = await fbGet('state/pos_'+posId);
+    if(!fresh) return;
+    const fq = Object.values(fresh.queue||{}).filter(i=>i&&i.deck&&i.num);
+    const sessionDecks = fq.filter(i=>['playing','expired','done'].includes(i.status));
     for(const d of sessionDecks){
       await fbSet('results/'+String(d.deck)+'/pos_'+posId, {result, ts});
     }
