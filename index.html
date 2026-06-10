@@ -270,8 +270,8 @@ window.navDeckConfirm = async function(){
     fbState = s||{};
     renderFairnessBar();
     renderNavStatus();
-    if(document.getElementById('nav-view-tickets').classList.contains('active')) renderTix();
-    if(document.getElementById('nav-view-book').classList.contains('active')) renderPosList();
+    if(document.getElementById('nav-view-tickets')?.classList.contains('active')) renderTix();
+    if(document.getElementById('nav-view-book')?.classList.contains('active')) renderPosList();
   });
   // Initial render after login
   renderFairnessBar();
@@ -293,8 +293,11 @@ window.navDeckConfirm = async function(){
   fbOn('results', s => {
     cachedResults = s||{};
     renderFairnessBar();
-    if(document.getElementById('nav-view-tickets').classList.contains('active')) renderTix();
-    if(document.getElementById('nav-view-book').classList.contains('active')) renderPosList();
+    // Always re-render tickets when results change — result badge needs to update
+    setTimeout(() => {
+      if(document.getElementById('nav-view-tickets')?.classList.contains('active')) renderTix();
+      if(document.getElementById('nav-view-book')?.classList.contains('active')) renderPosList();
+    }, 400);
   });
   if(!window._lastNotifTs) window._lastNotifTs = {};
   const lastNotifTs = window._lastNotifTs;
@@ -384,7 +387,7 @@ window.navConfirmRegister = async function(posId){
   const num = (ps.nextNum||0)+1;
   const q = toArr(ps.queue);
   await fbUpdate('state/pos_'+posId, {nextNum:num});
-  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:navDeck,status:'waiting',method:'app'});
+  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:String(navDeck),status:'waiting',method:'app'});
   // Auto-pair if duo mode on
   await autoPair(posId); // autoPair no-ops if duoMode is off
   showNotif('Queue #'+String(num).padStart(2,'0')+' — '+def.name,'success');
@@ -400,10 +403,14 @@ window.cancelBooking = async function(posId){
   const item = q.find(i=>String(i.deck)===String(navDeck));
   if(!item) return;
   await fbDel('state/pos_'+posId+'/queue/'+item.num);
-  if(item.status==='playing'){
+  if(['playing','expired','done'].includes(item.status)){
     await fbUpdate('state/pos_'+posId, {timerRunning:false,timerEnd:null,activeDuo:false});
   }
+  if(item?.pairedWith && item?.pairedWith!=='null'){
+    await autoPair(posId); // re-pair remaining decks
+  }
   showNotif('Booking cancelled','warning');
+  setTimeout(() => { renderTix(); renderPosList(); }, 800);
 };
 
 // ── ADMIN ACTIONS ──
@@ -441,8 +448,8 @@ window.startTimer = async function(posId){
   const timerEnd = Date.now()+(ps.duration||8)*60000;
 
   // If q[0] has a manual pair partner NOT at q[1], swap them first
-  if(ps.duoMode && q.length>=2 && q[0].pairedWith && q[0].pairedWith!=='null'){
-    const partnerIdx = q.findIndex((item,idx)=>idx>0&&String(item.deck)===String(q[0].pairedWith));
+  if(ps.duoMode && q.length>=2 && q[0]?.pairedWith && q[0]?.pairedWith!=='null'){
+    const partnerIdx = q.findIndex((item,idx)=>idx>0&&String(item.deck)===String(q[0]?.pairedWith));
     if(partnerIdx>1){
       const curr=q[1], partner=q[partnerIdx];
       await fbUpdate('state/pos_'+posId+'/queue/'+curr.num, {sortKey:partner.sortKey||partner.num});
@@ -565,14 +572,21 @@ window.adminAddDeck = async function(posId){
   const inp = document.getElementById('add-deck-'+posId);
   const val = (inp?.value||'').trim();
   if(!val||val==='undefined'){ showNotif('Enter deck number','warning'); return; }
+  // Validate: must be numeric 1-18
+  const deckNum = parseInt(val);
+  if(isNaN(deckNum)||deckNum<1||deckNum>18){ showNotif('Deck must be 1-18','warning'); return; }
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
+  // Check duplicate in this pos
+  if(q.some(i=>String(i.deck)===String(val))){ showNotif('Deck '+val+' already in this queue','warning'); return; }
+  // Check if already passed this pos
+  if(getResultSync(val, posId)==='passed'){ showNotif('Deck '+val+' already passed this station','warning'); return; }
   const num = (ps.nextNum||0)+1;
   await fbUpdate('state/pos_'+posId, {nextNum:num});
-  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:val,status:'waiting',method:'manual'});
-  await autoPair(posId); // autoPair no-ops if duoMode is off
+  await fbSet('state/pos_'+posId+'/queue/'+num, {num,deck:String(val),status:'waiting',method:'manual'});
+  await autoPair(posId);
   if(inp) inp.value='';
-  showNotif('Deck '+val+' added','success');
+  showNotif('Deck '+val+' added to queue','success');
 };
 
 window.adminRm = async function(posId, num){
@@ -622,9 +636,9 @@ async function autoPair(posId){
   // Find manual pairs already set — pairs where both decks reference each other
   const manualPairs = new Set();
   waitingQ.forEach(a=>{
-    if(!a.pairedWith||a.pairedWith==='null') return;
-    const partner = waitingQ.find(b=>String(b.deck)===String(a.pairedWith));
-    if(partner && String(partner.pairedWith)===String(a.deck)){
+    if(!a?.pairedWith||a?.pairedWith==='null') return;
+    const partner = waitingQ.find(b=>String(b.deck)===String(a?.pairedWith));
+    if(partner && String(partner?.pairedWith)===String(a.deck)){
       // Valid mutual pair — pbook it
       manualPairs.add(a.num);
       manualPairs.add(partner.num);
@@ -649,7 +663,7 @@ async function autoPair(posId){
     if(a&&b){
       updates['state/pos_'+posId+'/queue/'+a.num+'/pairedWith'] = String(b.deck);
       updates['state/pos_'+posId+'/queue/'+b.num+'/pairedWith'] = String(a.deck);
-      if(String(a.pairedWith)!==String(b.deck)) newPairs.push({a,b});
+      if(String(a?.pairedWith)!==String(b.deck)) newPairs.push({a,b});
     }
   }
   if(unpaired.length%2!==0){
@@ -838,7 +852,7 @@ function renderFairnessBar(){
     const ps = getPosState(def.id);
     const q = toArr(ps.queue);
     const item = q.find(i=>String(i.deck)===String(navDeck));
-    return item && item.pairedWith && item.status!=='playing';
+    return item && item?.pairedWith && item.status!=='playing';
   });
   const dot = document.getElementById('tickets-dot');
   if(dot) dot.style.display = hasPair ? 'inline-block' : 'none';
@@ -963,12 +977,12 @@ function renderTix(){
     const q = toArr(ps.queue);
     const item = q.find(i=>String(i.deck)===String(navDeck));
     const res = getResultSync(navDeck, def.id);
-    if(item||res) tickets.push({def, ps, item, q, res}); // active queue OR completed result
+    if(item) tickets.push({def, ps, item, q, res}); // active queue only — completed tickets hidden
   });
   if(!tickets.length){ noT.style.display='block'; area.innerHTML=''; return; }
   noT.style.display='none';
   area.innerHTML = tickets.map(({def,ps,item,q,res}) => {
-    const myIdx = item ? q.findIndex(i=>i.num===item.num) : -1;
+    const myIdx = item ? q.findIndex(i=>i.num===item?.num) : -1;
     const isDone = !item && !!res; // completed — removed from queue
     // Count only waiting decks ahead (exclude playing/expired)
     const activeStatuses = ['playing','expired'];
@@ -977,8 +991,8 @@ function renderTix(){
     const ahead = waitingIdx;
     const dur = ps.duration||8;
     const inQueue = !!item && myIdx>=0;
-    const isPlaying = !!(item&&item.status==='playing');
-    const num = item ? item.num : 0;
+    const isPlaying = !!(item&&item?.status==='playing');
+    const num = item ? item?.num : 0;
     const resTs = getResultTs(navDeck, def.id);
     const resBadge = res==='passed'
       ? mkTag('check','#7aaa88','rgba(0,255,136,.05)','rgba(0,255,136,.15)','Passed'+(resTs?' · '+fmtTs(resTs):''))
@@ -986,10 +1000,12 @@ function renderTix(){
       ? mkTag('x','#ff4444','rgba(255,68,68,.1)','rgba(255,68,68,.3)','Failed'+(resTs?' · '+fmtTs(resTs):''))
       : '';
     const cancelBtn = inQueue?`<button onclick="cancelBooking(${def.id})" style="margin-left:auto;padding:4px 10px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:transparent;color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Cancel</button>`:'';
-    const isDuoActive = !!(ps.activeDuo && item && item.status==='playing');
-    const duoPartner = (ps.activeDuo&&myIdx===0&&q.length>=2&&q[1]&&q[1].deck&&String(q[1].deck)!==String(navDeck))?String(q[1].deck):(ps.activeDuo&&myIdx===1&&q.length>=1&&q[0]&&q[0].deck&&String(q[0].deck)!==String(navDeck))?String(q[0].deck):null;
-    const pairBadge = (ps.duoMode&&item.pairedWith&&item.pairedWith!=='null'&&item.pairedWith!=='undefined'&&myIdx>=0) ? `<span class="badge" style="background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3);font-size:10px"><i class="ti ti-users"></i> Paired w/ DECK ${item.pairedWith}</span>` : '';
-    const st = isPlaying&&ps.duoMode&&isDuoActive?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active 🤝 w/ DECK '+(duoPartner||'?')+'</span>':isPlaying?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active</span>':waitingIdx===0&&ps.duoMode&&item.pairedWith&&item.pairedWith!=='null'?'<span class="badge badge-blue"><i class="ti ti-users"></i> Duo pair — get ready</span>':waitingIdx===0?'<span class="badge badge-amber">You\'re next</span>':waitingIdx>0?`<span class="badge badge-gray">${ahead} ahead</span>`:'';
+    const isDuoActive = !!(ps.activeDuo && item && item?.status==='playing');
+    // Find actual duo partner by status=playing, not by q[1] position
+    const partnerItem = ps.activeDuo ? q.find(i=>i.status==='playing'&&String(i.deck)!==String(navDeck)) : null;
+    const duoPartner = partnerItem ? String(partnerItem.deck) : null;
+    const pairBadge = (ps.duoMode&&item?.pairedWith&&item?.pairedWith!=='null'&&item?.pairedWith!=='undefined'&&myIdx>=0) ? `<span class="badge" style="background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3);font-size:10px"><i class="ti ti-users"></i> Paired w/ DECK ${item?.pairedWith}</span>` : '';
+    const st = isPlaying&&ps.duoMode&&isDuoActive?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active 🤝 w/ DECK '+(duoPartner||'?')+'</span>':isPlaying?'<span class="badge badge-green"><i class="ti ti-player-play"></i> Active</span>':waitingIdx===0&&ps.duoMode&&item?.pairedWith&&item?.pairedWith!=='null'?'<span class="badge badge-blue"><i class="ti ti-users"></i> Duo pair — get ready</span>':waitingIdx===0?'<span class="badge badge-amber">You\'re next</span>':waitingIdx>0?`<span class="badge badge-gray">${ahead} ahead</span>`:'';
     const remSecs = inQueue&&isPlaying&&ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
     const total = dur*60;
     const countdown = remSecs!==null?`<div class="ticket-countdown">
@@ -1009,10 +1025,10 @@ function renderTix(){
             <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:4px">DUO SESSION — PLAYING WITH</div>
             <div style="font-family:var(--font-mono);font-size:22px;font-weight:600;color:var(--blue);letter-spacing:3px">DECK ${duoPartner}</div>
           </div>`
-        :(ps.duoMode&&item.pairedWith&&item.pairedWith!=='null'&&!isDuoActive)?
+        :(ps.duoMode&&item?.pairedWith&&item?.pairedWith!=='null'&&!isDuoActive)?
           `<div style="background:rgba(0,170,255,.08);border:1px solid rgba(0,170,255,.3);border-radius:4px;padding:10px 14px;margin:10px 0 4px;text-align:center;animation:pairPulse 2s infinite">
             <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:4px">🤝 PAIRED — WILL PLAY WITH</div>
-            <div style="font-family:var(--font-mono);font-size:22px;font-weight:600;color:var(--blue);letter-spacing:3px">DECK ${item.pairedWith}</div>
+            <div style="font-family:var(--font-mono);font-size:22px;font-weight:600;color:var(--blue);letter-spacing:3px">DECK ${item?.pairedWith}</div>
             <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-top:4px">Get ready — your sessions will run together</div>
           </div>`
         :''}
@@ -1199,7 +1215,7 @@ function renderAdminContent(){
         const mIcon=item.method==='manual'?'ti-pencil':'ti-device-mobile';
         const badge='<span class="badge badge-gray">Waiting</span>';
         const isSelected = selForPair.some(s=>s.num===item.num);
-        const partnerDeck = (item.pairedWith&&item.pairedWith!=='null'&&item.pairedWith!=='undefined') ? item.pairedWith : null;
+        const partnerDeck = (item?.pairedWith&&item?.pairedWith!=='null'&&item?.pairedWith!=='undefined') ? item?.pairedWith : null;
         return '<div class="q-item" style="'+(isSelected?'border-color:var(--blue);background:rgba(0,170,255,.08)':'')+'">'
           +'<div onclick="togglePairSelect('+adminPosId+','+item.num+',\''+item.deck+'\')" style="width:20px;height:20px;border-radius:3px;border:1px solid '+(isSelected?'var(--blue)':'var(--border2)')+';background:'+(isSelected?'var(--blue)':'transparent')+';cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:white;font-size:12px;margin-right:2px">'+(isSelected?'✓':'')+'</div>'
           +'<div class="qnum">'+item.num+'</div>'
