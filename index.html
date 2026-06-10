@@ -158,14 +158,21 @@ function startGlobalTick(){
       const etRem = Math.max(0,Math.round((et.timerEnd-Date.now())/1000));
       const etTotal = et.totalSecs||7200;
       const pct = Math.round((etRem/etTotal)*100);
-      // Update admin event timer display if visible
+      const fmtET = s=>{s=Math.max(0,s);return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
+      const etColor = etRem<=300?'var(--red)':etRem<=900?'var(--amber)':'var(--green)';
+      // Update admin event tab display
       const etD = document.getElementById('et-display');
       const etB = document.getElementById('et-bar');
-      const fmtET = s=>{s=Math.max(0,s);return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
-      if(etD){ etD.textContent=fmtET(etRem); etD.style.color=etRem<=300?'var(--red)':etRem<=900?'var(--amber)':'var(--green)'; }
+      if(etD){ etD.textContent=fmtET(etRem); etD.style.color=etColor; }
       if(etB){ etB.style.width=pct+'%'; etB.className='timer-fill '+(etRem<=300?'tf-red':etRem<=900?'tf-amber':'tf-green'); }
-      // Navigator event banner
-      updateEventBanner(etRem, etTotal, et.logbookOpen||false);
+      // Admin topbar mini timer
+      const adminBar = document.getElementById('admin-event-bar');
+      if(adminBar){
+        adminBar.style.display='block';
+        adminBar.textContent='⏱ '+fmtET(etRem);
+        adminBar.style.color=etColor;
+        adminBar.style.borderColor=etRem<=300?'rgba(255,68,68,.4)':etRem<=900?'rgba(255,184,0,.4)':'var(--border2)';
+      }
       // Auto-open logbook at 15 min
       if(etRem<=900&&etRem>895&&!et.logbookOpen){
         fbUpdate('eventTimer',{logbookOpen:true});
@@ -309,6 +316,15 @@ window.navDeckConfirm = async function(){
   });
   if(!window._lastNotifTs) window._lastNotifTs = {};
   const lastNotifTs = window._lastNotifTs;
+  fbOn('eventTimer', et => {
+    window._eventTimer = et||{};
+    const banner = document.getElementById('nav-event-banner');
+    if(!et||(!et.running&&!et.logbookOpen)){
+      if(banner) banner.style.display='none'; return;
+    }
+    const remSecs = et.running&&et.timerEnd ? Math.max(0,Math.round((et.timerEnd-Date.now())/1000)) : 0;
+    updateEventBanner(remSecs, et.totalSecs||7200, et.logbookOpen||false);
+  });
   fbOn('notifications', s => {
     if(!s||!navDeck) return;
     Object.values(s).forEach(n => {
@@ -332,8 +348,16 @@ window.navDeckConfirm = async function(){
   // Render all tabs immediately with fresh data
   renderFairnessBar();
   renderNavStatus();
-  renderTix(); // render tickets even if tab is not active yet — data is ready
+  renderTix();
   renderPosList();
+  // Show event banner if timer already running
+  const _et = window._eventTimer||{};
+  if(_et.running&&_et.timerEnd){
+    const _rem = Math.max(0,Math.round((_et.timerEnd-Date.now())/1000));
+    updateEventBanner(_rem, _et.totalSecs||7200, _et.logbookOpen||false);
+  } else if(_et.logbookOpen){
+    updateEventBanner(0, _et.totalSecs||7200, true);
+  }
 
   const count = POS_DEFS.filter(def => toArr(getPosState(def.id).queue).some(i=>String(i.deck)===String(navDeck))).length;
   if(count>0) showNotif(count+' active booking(s) found for Deck '+navDeck,'success');
@@ -1668,6 +1692,7 @@ video{width:100%;max-width:260px;border-radius:3px;margin:0 auto;display:block;b
       <span id="admin-pos-label" style="font-family:var(--font-mono);font-size:11px;color:var(--blue)"></span>
     </div>
     <div style="display:flex;gap:6px;align-items:center">
+      <div id="admin-event-bar" style="display:none;font-family:var(--font-mono);font-size:12px;font-weight:600;padding:3px 10px;border-radius:3px;border:1px solid var(--border2);color:var(--text3)"></div>
       <span style="font-family:var(--font-mono);font-size:10px;color:var(--text3)"><span class="save-dot"></span>LIVE</span>
       <button class="btn btn-sm" onclick="logout()"><i class="ti ti-logout"></i> Exit</button>
     </div>
