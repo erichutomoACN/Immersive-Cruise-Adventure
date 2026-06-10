@@ -437,6 +437,44 @@ window.cancelBooking = async function(posId){
 };
 
 // ── ADMIN ACTIONS ──
+window.startTimerWithSelection = async function(posId){
+  const sel = _manualPairSelection[posId]||[];
+  if(!sel.length){ showNotif('Select at least one group first','warning'); return; }
+  const ps = getPosState(posId);
+  if(ps.timerRunning) return;
+
+  const timerEnd = Date.now()+(ps.duration||8)*60000;
+  const isDuo = ps.duoMode && sel.length>=2;
+
+  // Promote selected decks to front of queue by setting their sortKeys
+  // sel[0] gets sortKey=1, sel[1] gets sortKey=2, others shift back
+  const q = toArr(ps.queue);
+  const updates = {};
+
+  if(isDuo){
+    // Set sel[0] and sel[1] as first two
+    updates['state/pos_'+posId+'/queue/'+sel[0].num+'/sortKey'] = -2;
+    updates['state/pos_'+posId+'/queue/'+sel[1].num+'/sortKey'] = -1;
+  } else {
+    updates['state/pos_'+posId+'/queue/'+sel[0].num+'/sortKey'] = -1;
+  }
+  await update(ref(db), updates);
+  await new Promise(r=>setTimeout(r,300));
+
+  // Re-read fresh queue
+  const fresh = await fbGet('state/pos_'+posId);
+  const fq = Object.values(fresh.queue||{}).filter(i=>i&&i.deck&&i.num)
+    .sort((a,b)=>(a.sortKey||a.num)-(b.sortKey||b.num));
+
+  await fbUpdate('state/pos_'+posId, {timerRunning:true, timerEnd, activeDuo:isDuo});
+  await fbUpdate('state/pos_'+posId+'/queue/'+fq[0].num, {status:'playing'});
+  if(isDuo && fq.length>=2) await fbUpdate('state/pos_'+posId+'/queue/'+fq[1].num, {status:'playing'});
+
+  // Clear selection
+  _manualPairSelection[posId]=[];
+  await autoPair(posId);
+};
+
 window.startTimer = async function(posId){
   const ps = getPosState(posId);
   let q = toArr(ps.queue);
@@ -487,14 +525,21 @@ window.adminEndSession = async function(posId, result, deckNum){
   const wasDuo = ps.activeDuo && q.length>=2 && q[1].status==='playing';
 
   if(deckNum){
-    // Individual result for one deck in a duo
-    await fbSet('results/'+deckNum+'/pos_'+posId, {result, ts});
+    // Individual result for one deck in a duo — only advance when BOTH have results
+    await fbSet('results/'+String(deckNum)+'/pos_'+posId, {result, ts});
+    // Mark this deck as expired/done in queue (but keep in queue until partner is done)
+    const thisItem = q.find(i=>String(i.deck)===String(deckNum));
+    if(thisItem) await fbUpdate('state/pos_'+posId+'/queue/'+thisItem.num, {status:'done'});
     showNotif('Deck '+deckNum+' — '+result.toUpperCase(), result==='passed'?'success':'warning');
-    // Check if both decks now have results — if so, advance queue
-    const otherDeck = q[0].deck===deckNum ? (q[1]?q[1].deck:null) : q[0].deck;
-    if(otherDeck){
-      const otherResult = await fbGet('results/'+otherDeck+'/pos_'+posId);
-      if(otherResult) await adminNext(posId, false); // both done
+    // Check if partner also has result
+    const playingQ = q.filter(i=>i.status==='playing'||i.status==='done'||i.status==='expired');
+    const otherItem = playingQ.find(i=>String(i.deck)!==String(deckNum));
+    if(otherItem){
+      const otherResult = await fbGet('results/'+String(otherItem.deck)+'/pos_'+posId);
+      if(otherResult) await adminNext(posId, false); // both done — advance
+      else showNotif('Waiting for result of Deck '+otherItem.deck,'warning');
+    } else {
+      await adminNext(posId, false); // solo — advance immediately
     }
   } else {
     // Same result for all active decks
@@ -510,7 +555,7 @@ async function adminNext(posId, auto){
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
   if(!q.length) return;
-  const wasDuo = ps.activeDuo && q.length>=2 && q[1] && (q[1].status==='playing'||q[1].status==='expired');
+  const wasDuo = ps.activeDuo && q.length>=2 && q[1] && ['playing','expired','done'].includes(q[1].status);
   await fbDel('state/pos_'+posId+'/queue/'+q[0].num);
   if(wasDuo) await fbDel('state/pos_'+posId+'/queue/'+q[1].num);
   await fbUpdate('state/pos_'+posId, {timerRunning:false, timerEnd:null, activeDuo:false});
@@ -1043,390 +1088,294 @@ function renderAdminSidebar(){
   }).join('');
 }
 
+      + '</div>';
+
 // ── RENDER: ADMIN CONTENT ──
 function renderAdminContent(){
   const el = document.getElementById('admin-content'); if(!el||!adminPosId) return;
   const def=POS_DEFS[adminPosId-1], ps=getPosState(adminPosId), q=toArr(ps.queue), dur=ps.duration||8;
   const rem = ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
   const total = dur*60;
+  const isExpired = q.length>0 && (q[0].status==='expired' || (ps.activeDuo&&q.length>=2&&q[1]&&q[1].status==='expired'));
 
   let timerBlock='';
+  // Get selected decks for manual start
+  const selForStart = (_manualPairSelection[adminPosId]||[]);
+  const canStartDuo = ps.duoMode && selForStart.length===2;
+  const canStartSolo = !ps.duoMode && selForStart.length===1 || (ps.duoMode && selForStart.length===1);
+  const canStart = selForStart.length>=1 && !ps.timerRunning;
+
   if(q.length>0){
-    const first=q[0];
-    const firstSelBox = ps.duoMode && first ? `<div onclick="togglePairSelect(${adminPosId},${first.num},'${first.deck||''}')" style="width:20px;height:20px;border-radius:3px;border:1px solid ${(_manualPairSelection[adminPosId]||[]).some(s=>s.num===first.num)?'var(--blue)':'var(--border2)'};background:${(_manualPairSelection[adminPosId]||[]).some(s=>s.num===first.num)?'var(--blue)':'transparent'};cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:white;font-size:12px;margin-right:6px;vertical-align:middle">${(_manualPairSelection[adminPosId]||[]).some(s=>s.num===first.num)?'✓':''}</div>` : '';
-    const isExpired = q.length>0 && (q[0].status==='expired' || (ps.activeDuo&&q.length>=2&&q[1]&&q[1].status==='expired'));
-  if(isExpired){
-    timerBlock=`<div class="card" style="margin-bottom:10px;border-color:rgba(255,184,0,.4)">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-        <span style="font-family:var(--font-mono);font-size:10px;color:var(--amber)">⏰ TIME EXPIRED</span>
-        <span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--amber)">${ps.activeDuo&&q.length>=2&&q[1]?'DECK '+q[0].deck+' + DECK '+q[1].deck:'DECK '+(q[0].deck||'?')}</span>
-      </div>
-      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text3);margin-bottom:10px">Session ended — set result for each group</div>
-      ${ps.activeDuo&&q.length>=2&&q[1]&&q[1].status==='expired'?`
-        <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-bottom:6px;letter-spacing:1px">SET RESULT PER DECK</div>
-        <div style="background:var(--bg2);border-radius:4px;padding:8px;margin-bottom:5px">
-          <div style="font-family:var(--font-mono);font-size:11px;color:var(--text);margin-bottom:5px">DECK ${q[0].deck||'?'}</div>
-          <div style="display:flex;gap:4px">
-            <button onclick="adminEndSession(${adminPosId},'passed','${q[0].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
-            <button onclick="adminEndSession(${adminPosId},'failed','${q[0].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
-          </div>
-        </div>
-        <div style="background:var(--bg2);border-radius:4px;padding:8px;margin-bottom:5px">
-          <div style="font-family:var(--font-mono);font-size:11px;color:var(--text);margin-bottom:5px">DECK ${q[1].deck||'?'}</div>
-          <div style="display:flex;gap:4px">
-            <button onclick="adminEndSession(${adminPosId},'passed','${q[1].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
-            <button onclick="adminEndSession(${adminPosId},'failed','${q[1].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
-          </div>
-        </div>`:`
-        <div style="display:flex;gap:6px">
-          <button onclick="adminEndSession(${adminPosId},'passed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
-          <button onclick="adminEndSession(${adminPosId},'failed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
-        </div>`}
-    </div>`;
-  } else if(ps.timerRunning&&rem!==null){
-      timerBlock=`<div class="card" style="margin-bottom:10px;border-color:rgba(0,255,136,.3)">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-          <span style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">ACTIVE SLOT TIMER</span>
-          <span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--green)">DECK ${first.deck||"?"}</span>
-        </div>
-        <div id="timer-${adminPosId}" class="timer-display${rem<=30?' danger':rem<=total*.3?' warning':''}">${fmt(rem)}</div>
-        <div class="timer-bar"><div id="timerbar-${adminPosId}" class="timer-fill${rem<=30?' tf-red':rem<=total*.3?' tf-amber':' tf-green'}" style="width:${Math.round((rem/total)*100)}%"></div></div>
-        <div style="margin-top:10px;display:flex;gap:6px">
-          ${ps.activeDuo&&q.length>=2&&q[1].status==='playing' ? `
-            <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-bottom:6px;letter-spacing:1px">SET RESULT PER DECK</div>
+    const isExpired = q.some(i=>i.status==='expired');
+
+    if(isExpired){
+      // Expired state — show result buttons
+      const expiredQ = q.filter(i=>i.status==='expired');
+      const wasDuo = ps.activeDuo && expiredQ.length>=2;
+      timerBlock='<div class="card" style="margin-bottom:10px;border-color:rgba(255,184,0,.4)">'+
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'+
+          '<span style="font-family:var(--font-mono);font-size:10px;color:var(--amber)">⏰ TIME EXPIRED</span>'+
+          '<span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--amber)">'+(wasDuo?'DECK '+(expiredQ[0]?.deck||'?')+' + DECK '+(expiredQ[1]?.deck||'?'):'DECK '+(expiredQ[0]?.deck||'?'))+'</span>'+
+        '</div>'+
+        '<div style="font-family:var(--font-mono);font-size:11px;color:var(--text3);margin-bottom:10px">Session ended — set result for each group</div>'+
+        (wasDuo?
+          '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-bottom:6px;letter-spacing:1px">SET RESULT PER DECK</div>'+
+          expiredQ.slice(0,2).map(item=>`
             <div style="background:var(--bg2);border-radius:4px;padding:8px;margin-bottom:5px">
-              <div style="font-family:var(--font-mono);font-size:11px;color:var(--text);margin-bottom:5px">DECK ${q[0].deck}</div>
+              <div style="font-family:var(--font-mono);font-size:11px;color:var(--text);margin-bottom:5px">DECK ${item.deck||'?'}</div>
               <div style="display:flex;gap:4px">
-                <button onclick="adminEndSession(${adminPosId},'passed','${q[0].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
-                <button onclick="adminEndSession(${adminPosId},'failed','${q[0].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
+                <button onclick="adminEndSession(${adminPosId},'passed','${item.deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
+                <button onclick="adminEndSession(${adminPosId},'failed','${item.deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
               </div>
-            </div>
+            </div>`).join('')
+          :
+          '<div style="display:flex;gap:6px">'+
+            '<button onclick="adminEndSession('+adminPosId+",'passed'"+')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>'+
+            '<button onclick="adminEndSession('+adminPosId+",'failed'"+')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>'+
+          '</div>'
+        )+'</div>';
+
+    } else if(ps.timerRunning){
+      // Active timer — show countdown + result buttons
+      const rem = ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
+      const total = dur*60;
+      const playingQ = q.filter(i=>i.status==='playing');
+      const wasDuo = ps.activeDuo && playingQ.length>=2;
+      timerBlock='<div class="card" style="margin-bottom:10px;border-color:rgba(0,255,136,.3)">'+
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'+
+          '<span style="font-family:var(--font-mono);font-size:10px;color:var(--text3)">'+(wasDuo?'DUO SESSION TIMER':'ACTIVE SLOT TIMER')+'</span>'+
+          '<span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--green)">DECK '+(playingQ[0]?.deck||'?')+(wasDuo?' + DECK '+(playingQ[1]?.deck||'?'):'')+'</span>'+
+        '</div>'+
+        '<div id="timer-'+adminPosId+'" class="timer-display'+(rem<=30?' danger':rem<=total*.3?' warning':'')+'">'+(rem!==null?fmt(rem):'--:--')+'</div>'+
+        '<div class="timer-bar"><div id="timerbar-'+adminPosId+'" class="timer-fill'+(rem<=30?' tf-red':rem<=total*.3?' tf-amber':' tf-green')+'" style="width:'+(rem!==null?Math.round((rem/total)*100):100)+'%"></div></div>'+
+        (wasDuo?
+          '<div style="margin-top:10px">'+
+          '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-bottom:6px;letter-spacing:1px">SET RESULT PER DECK</div>'+
+          playingQ.slice(0,2).map(item=>`
             <div style="background:var(--bg2);border-radius:4px;padding:8px;margin-bottom:5px">
-              <div style="font-family:var(--font-mono);font-size:11px;color:var(--text);margin-bottom:5px">DECK ${q[1].deck}</div>
+              <div style="font-family:var(--font-mono);font-size:11px;color:var(--text);margin-bottom:5px">DECK ${item.deck||'?'}</div>
               <div style="display:flex;gap:4px">
-                <button onclick="adminEndSession(${adminPosId},'passed','${q[1].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
-                <button onclick="adminEndSession(${adminPosId},'failed','${q[1].deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
+                <button onclick="adminEndSession(${adminPosId},'passed','${item.deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
+                <button onclick="adminEndSession(${adminPosId},'failed','${item.deck}')" style="flex:1;padding:6px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
               </div>
-            </div>
-            <button onclick="cancelPair(${adminPosId})" style="width:100%;padding:7px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:transparent;color:var(--amber);border:1px solid rgba(255,184,0,.4)"><i class="ti ti-unlink"></i> Cancel Pair</button>
-          ` : `
-            <button onclick="adminEndSession(${adminPosId},'passed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>
-            <button onclick="adminEndSession(${adminPosId},'failed')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>
-          `}
-        </div></div>`;
-    } else {
-      timerBlock=`<div class="card" style="margin-bottom:10px;border-style:dashed">
-        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-bottom:8px">READY TO START</div>
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-          <span style="font-size:13px;font-weight:700;color:var(--text)">${firstSelBox}DECK ${first.deck}</span>
-          <span style="font-family:var(--font-mono);font-size:11px;color:var(--text3)">${dur}m session</span>
-        </div>
-        <div style="display:flex;gap:6px;margin-bottom:8px">
-          <button class="btn btn-sm" style="flex:1;justify-content:center" onclick="notifyStandby(${adminPosId})"><i class="ti ti-bell"></i> Notify Standby</button>
-          ${ps.duoMode&&q.length>=2?`<button class="btn btn-sm btn-blue" style="flex:1;justify-content:center" onclick="notifyPair(${adminPosId})"><i class="ti ti-users"></i> Notify Pair</button>`:''}
-        </div>
-        <button class="btn btn-primary" onclick="startTimer(${adminPosId})"><i class="ti ti-player-play"></i> ${ps.duoMode&&q.length>=2?'Start Duo Session':'Start Session'}</button>
-        ${ps.duoMode&&q.length>=2?`<button class="btn btn-sm" style="margin-top:6px;width:100%;justify-content:center;color:var(--text3)" onclick="startTimerSolo(${adminPosId})"><i class="ti ti-user"></i> Play Solo (skip pair)</button>`:''}
-        <button class="btn btn-sm btn-red" style="margin-top:6px;width:100%;justify-content:center" onclick="adminRm(${adminPosId},${first.num})"><i class="ti ti-trash"></i> Remove — Not Ready</button>
-        </div>`;
+            </div>`).join('')+
+          '<button onclick="cancelPair('+adminPosId+')" style="width:100%;padding:7px;border-radius:4px;font-family:var(--font-ui);font-size:10px;font-weight:700;text-transform:uppercase;cursor:pointer;background:transparent;color:var(--amber);border:1px solid rgba(255,184,0,.4)"><i class="ti ti-unlink"></i> Cancel Pair</button>'+
+          '</div>'
+          :
+          '<div style="margin-top:10px;display:flex;gap:6px">'+
+            '<button onclick="adminEndSession('+adminPosId+",'passed'"+')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(0,255,136,.1);color:#00ff88;border:1px solid rgba(0,255,136,.4)"><i class="ti ti-trophy"></i> Passed</button>'+
+            '<button onclick="adminEndSession('+adminPosId+",'failed'"+')" style="flex:1;padding:8px;border-radius:4px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.4)"><i class="ti ti-x"></i> Failed</button>'+
+          '</div>'
+        )+'</div>';
+
+    } else if(canStart){
+      // Decks selected — show start button
+      const startDuo = canStartDuo;
+      timerBlock='<div class="card" style="margin-bottom:10px;border-color:rgba(0,255,136,.2)">'+
+        '<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-bottom:8px">SELECTED TO PLAY</div>'+
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'+
+          selForStart.map(s=>`<span style="font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--green)">DECK ${s.deck}</span>`).join('<span style="color:var(--text3);font-size:12px;align-self:center">+</span>')+
+        '</div>'+
+        '<button class="btn btn-primary" onclick="startTimerWithSelection('+adminPosId+')"><i class="ti ti-player-play"></i> '+(startDuo?'Start Duo Session':'Start Session')+'</button>'+
+        '</div>';
     }
   }
 
-  // In duo session, q[1] is also playing/expired — exclude from waiting list
-  const playingOrExpired = ['playing','expired'];
-  const waiting = q.filter((item,i) => i>0 && !playingOrExpired.includes(item.status));
   const selForPair = (_manualPairSelection[adminPosId]||[]);
+  const playingOrExpiredStatuses = ['playing','expired','done'];
+  const waiting = q.filter((item,i) => !playingOrExpiredStatuses.includes(item.status) && i>=(ps.activeDuo?2:1));
   const pairBtnHtml = ps.duoMode&&selForPair.length===2
-    ? `<button class="btn btn-blue btn-sm" style="width:100%;justify-content:center;margin-bottom:8px" onclick="confirmManualPair(${adminPosId})"><i class="ti ti-users"></i> Pair: DECK ${selForPair[0].deck} + DECK ${selForPair[1].deck}</button>`
+    ? '<button class="btn btn-blue btn-sm" style="width:100%;justify-content:center;margin-bottom:8px" onclick="confirmManualPair('+adminPosId+')"><i class="ti ti-users"></i> Pair: DECK '+selForPair[0].deck+' + DECK '+selForPair[1].deck+'</button>'
     : ps.duoMode&&selForPair.length===1
-    ? `<div style="font-family:var(--font-mono);font-size:10px;color:var(--blue);margin-bottom:6px"><i class="ti ti-check"></i> DECK ${selForPair[0].deck} selected — pick one more to pair</div>`
+    ? '<div style="font-family:var(--font-mono);font-size:10px;color:var(--blue);margin-bottom:6px"><i class="ti ti-check"></i> DECK '+selForPair[0].deck+' selected — pick one more to pair</div>'
     : '';
-  const waitHtml = waiting.length?
-    pairBtnHtml+`<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:6px">QUEUE (${waiting.length})</div>`+
-    waiting.map((item,i)=>{
-      const mIcon=item.method==='scan'?'ti-scan':item.method==='manual'?'ti-pencil':'ti-device-mobile';
-      const badge='<span class="badge badge-gray">Waiting</span>';
-      // i=0 is position 2 in full queue (waiting[0]), i=1 is position 3, etc.
-      const realPos = i+2; // position in overall queue (1-based)
-      // Allow manual pair reorder anytime duoMode is on — even while timer running
-      // i>0 means this is position 3+ in the waiting list (position 2+ in full queue)
-      // If activeDuo: waiting[0] is already position 3 — can pair waiting[1]+ up
-      const canPairManually = ps.duoMode && i>0;
-      const isSelected = (_manualPairSelection[adminPosId]||[]).some(s=>s.num===item.num);
-      const partnerDeck = (item.pairedWith&&item.pairedWith!=='null'&&item.pairedWith!=='undefined') ? item.pairedWith : null;
-      return `<div class="q-item" style="${isSelected?'border-color:var(--blue);background:rgba(0,170,255,.08)':''}">
-        ${ps.duoMode&&item.deck?`<div onclick="togglePairSelect(${adminPosId},${item.num},'${item.deck}')" style="width:20px;height:20px;border-radius:3px;border:1px solid ${isSelected?'var(--blue)':'var(--border2)'};background:${isSelected?'var(--blue)':'transparent'};display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;color:white;font-size:12px;margin-right:2px">${isSelected?'✓':''}</div>`:''}
-        <div class="qnum">${item.num}</div>
-        <div class="qi-info">
-          <div class="qi-name">DECK ${item.deck||'?'}</div>
-          <div class="qi-sub">
-            ${badge} <i class="ti ${mIcon}" style="font-size:11px;opacity:.5"></i>
-            ${partnerDeck?`<span style="font-size:9px;padding:1px 6px;border-radius:2px;background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3)"><i class="ti ti-users"></i> w/ DECK ${partnerDeck}</span>`:''}
-          </div>
-        </div>
-        <div style="display:flex;gap:4px">
-          <button class="btn btn-sm btn-red" onclick="adminRm(${adminPosId},${item.num})"><i class="ti ti-trash"></i></button>
-        </div></div>`;
-    }).join(''):
-    `<div class="empty-state" style="padding:1rem 0"><i class="ti ti-users"></i>No one queued</div>`;
+  const waitHtml = waiting.length
+    ? pairBtnHtml+'<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:6px">QUEUE ('+waiting.length+')</div>'
+      +waiting.map(function(item,i){
+        const mIcon=item.method==='manual'?'ti-pencil':'ti-device-mobile';
+        const badge='<span class="badge badge-gray">Waiting</span>';
+        const isSelected = selForPair.some(s=>s.num===item.num);
+        const partnerDeck = (item.pairedWith&&item.pairedWith!=='null'&&item.pairedWith!=='undefined') ? item.pairedWith : null;
+        return '<div class="q-item" style="'+(isSelected?'border-color:var(--blue);background:rgba(0,170,255,.08)':'')+'">'
+          +(ps.duoMode?'<div onclick="togglePairSelect('+adminPosId+','+item.num+',\''+item.deck+'\')" style="width:20px;height:20px;border-radius:3px;border:1px solid '+(isSelected?'var(--blue)':'var(--border2)')+';background:'+(isSelected?'var(--blue)':'transparent')+';cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:white;font-size:12px;margin-right:2px">'+(isSelected?'✓':'')+'</div>':'')
+          +'<div class="qnum">'+item.num+'</div>'
+          +'<div class="qi-info"><div class="qi-name">DECK '+item.deck+'</div>'
+          +'<div class="qi-sub">'+badge+(partnerDeck?' <span style="font-size:9px;padding:1px 6px;border-radius:2px;background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.3)"><i class="ti ti-users"></i> w/ DECK '+partnerDeck+'</span>':'')+'</div></div>'
+          +'<div style="display:flex;gap:4px">'
+          +'<button class="btn btn-sm btn-red" onclick="adminRm('+adminPosId+','+item.num+')"><i class="ti ti-trash"></i></button>'
+          +'</div></div>';
+      }).join('')
+    : '<div class="empty-state" style="padding:1rem 0"><i class="ti ti-users"></i>No one queued</div>';
 
-  el.innerHTML = `
-    <div style="padding:10px 12px;background:var(--bg3);border-radius:4px;margin-bottom:10px;border-left:2px solid ${def.topColor}">
-      <div style="font-size:13px;font-weight:700;color:${def.topColor}"><i class="ti ${def.icon}"></i> ${def.name}</div>
-      <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:2px">&gt; ${def.mission}</div>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;font-family:var(--font-mono);font-size:11px;color:var(--text3)">DURATION/SLOT:
-      <div style="display:flex;align-items:center;gap:6px">
-        <button class="dur-btn" onclick="changeDur(${adminPosId},-1)">−</button>
-        <span style="font-family:var(--font-mono);font-size:12px;min-width:40px;text-align:center;color:var(--text)">${dur}m</span>
-        <button class="dur-btn" onclick="changeDur(${adminPosId},1)">+</button>
-      </div>
-      <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
-        <span style="font-size:10px;color:var(--text3)">DUO</span>
-        <button onclick="toggleDuo(${adminPosId})" style="width:44px;height:24px;border-radius:12px;border:1px solid ${ps.duoMode?'var(--green)':'var(--border2)'};background:${ps.duoMode?'var(--green-dark)':'var(--bg3)'};cursor:pointer;position:relative;transition:all .2s">
-          <div style="width:18px;height:18px;border-radius:50%;background:${ps.duoMode?'var(--green)':'var(--text3)'};position:absolute;top:2px;${ps.duoMode?'right:2px':'left:2px'};transition:all .2s"></div>
-        </button>
-        <span style="font-family:var(--font-mono);font-size:10px;color:${ps.duoMode?'var(--green)':'var(--text3)'}">${ps.duoMode?'ON':'OFF'}</span>
-      </div>
-    </div>
-    <div class="add-deck-row"><input id="add-deck-${adminPosId}" placeholder="Deck number" maxlength="6" onkeydown="if(event.key==='Enter') adminAddDeck(${adminPosId})"/><button class="btn btn-blue btn-sm" onclick="adminAddDeck(${adminPosId})"><i class="ti ti-plus"></i> Add</button></div>
-    ${timerBlock}${waitHtml}`;
+  el.innerHTML = '<div style="padding:10px 12px;background:var(--bg3);border-radius:4px;margin-bottom:10px;border-left:2px solid '+def.topColor+'">'
+    +'<div style="font-size:13px;font-weight:700;color:'+def.topColor+'"><i class="ti '+def.icon+'"></i> '+def.name+'</div>'
+    +'<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-top:2px">&gt; '+def.mission+'</div>'
+    +'</div>'
+    +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;font-family:var(--font-mono);font-size:11px;color:var(--text3)">DURATION/SLOT:'
+    +'<div style="display:flex;align-items:center;gap:6px">'
+    +'<button class="dur-btn" onclick="changeDur('+adminPosId+',-1)">−</button>'
+    +'<span style="font-family:var(--font-mono);font-size:12px;min-width:40px;text-align:center;color:var(--text)">'+dur+'m</span>'
+    +'<button class="dur-btn" onclick="changeDur('+adminPosId+',1)">+</button>'
+    +'</div>'
+    +'<div style="margin-left:auto;display:flex;align-items:center;gap:6px">'
+    +'<span style="font-size:10px;color:var(--text3)">DUO</span>'
+    +'<button onclick="toggleDuo('+adminPosId+')" style="width:44px;height:24px;border-radius:12px;border:1px solid '+(ps.duoMode?'var(--green)':'var(--border2)')+';background:'+(ps.duoMode?'var(--green-dark)':'var(--bg3)')+';cursor:pointer;position:relative;transition:all .2s">'
+    +'<div style="width:18px;height:18px;border-radius:50%;background:'+(ps.duoMode?'var(--green)':'var(--text3)')+';position:absolute;top:2px;'+(ps.duoMode?'right:2px':'left:2px')+';transition:all .2s"></div>'
+    +'</button>'
+    +'<span style="font-family:var(--font-mono);font-size:10px;color:'+(ps.duoMode?'var(--green)':'var(--text3)')+';">'+(ps.duoMode?'ON':'OFF')+'</span>'
+    +'</div></div>'
+    +'<div class="add-deck-row"><input id="add-deck-'+adminPosId+'" placeholder="Deck number" maxlength="6" onkeydown="if(event.key===\'Enter\') adminAddDeck('+adminPosId+')" /><button class="btn btn-blue btn-sm" onclick="adminAddDeck('+adminPosId+')"><i class="ti ti-plus"></i> Add</button></div>'
+    +timerBlock+waitHtml;
 }
 
-// renderAdminQR removed
+// ── RENDER: ADMIN SIDEBAR ──
+function renderAdminSidebar(){
+  const el = document.getElementById('admin-sidebar'); if(!el) return;
+  el.innerHTML = POS_DEFS.map(function(def){
+    const ps = getPosState(def.id);
+    const q = toArr(ps.queue), len=q.length, isActive=def.id===adminPosId;
+    return '<button class="apos-tab'+(isActive?' active':'')+'" onclick="selectAdminPos('+def.id+')">'
+      +'<div class="apos-num" style="border-color:'+def.topColor+'44;color:'+def.topColor+'">S'+def.id+'</div>'
+      +'<div style="flex:1;min-width:0">'
+      +'<div style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+def.name+'</div>'
+      +'<div style="font-family:var(--font-mono);font-size:10px;opacity:.6">'+len+' · '+(ps.duration||8)+'m'+(ps.timerRunning?' ⏱':'')+'</div>'
+      +'</div>'
+      +(len>0?'<span style="background:'+(len<=2?'rgba(0,255,136,.1)':'rgba(255,68,68,.1)')+';color:'+(len<=2?'var(--green)':'var(--red)')+';font-size:10px;padding:1px 6px;border-radius:2px;font-family:var(--font-mono)">'+len+'</span>':'')
+      +'</button>';
+  }).join('');
+}
 
-// ── TABS ──
-window.navTab = function(name,btn){
-  document.querySelectorAll('#screen-nav .tab').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('#screen-nav .view').forEach(v=>v.classList.remove('active'));
-  if(btn) btn.classList.add('active');
-  document.getElementById('nav-view-'+name).classList.add('active');
-  if(name==='book'){ renderFairnessBar(); renderPosList(); }
-  if(name==='tickets') renderTix();
-  if(name==='status') renderNavStatus();
-};
+// ── RENDER: DASHBOARD ──
 function renderDashboard(){
   const el = document.getElementById('admin-dashboard-content'); if(!el) return;
   const filter = window._dashFilter || 'all';
-
-  // Build history from results + current queues
   const rows = [];
   const res = cachedResults||{};
-  POS_DEFS.forEach(def=>{
+  POS_DEFS.forEach(function(def){
     const ps = getPosState(def.id);
     const q = toArr(ps.queue);
     const dur = ps.duration||8;
     const rem = ps.timerRunning&&ps.timerEnd?Math.max(0,Math.round((ps.timerEnd-Date.now())/1000)):null;
-
-    // Active / waiting rows from current queue
-    q.forEach((item,i)=>{
-      rows.push({
-        posId:def.id, posName:def.name, posIcon:def.icon, topColor:def.topColor, pnClass:def.pnClass,
-        deck:item.deck,
-        status: item.status==='playing'?(ps.timerRunning?'playing':'ready'):item.status==='called'?'called':'waiting',
-        rem, dur, position:i+1, queueLen:q.length
-      });
+    q.forEach(function(item,i){
+      rows.push({posId:def.id,posName:def.name,posIcon:def.icon,topColor:def.topColor,pnClass:def.pnClass,
+        deck:item.deck,status:item.status==='playing'?(ps.timerRunning?'playing':'ready'):item.status==='called'?'called':item.status==='expired'?'expired':'waiting',
+        rem,dur,position:i+1,queueLen:q.length});
     });
-
-    // Completed (passed/failed) from results
-    Object.entries(res).forEach(([deck, deckRes])=>{
+    Object.entries(res).forEach(function([deck,deckRes]){
       if(!deckRes) return;
-      const raw = deckRes['pos_'+def.id];
-      if(!raw) return;
-      // Support both old string format and new {result, ts} object
-      const resultStr = typeof raw === 'object' ? raw.result : raw;
+      const r = deckRes['pos_'+def.id];
+      if(!r) return;
+      const resultStr = typeof r==='object'?r.result:r;
       if(!resultStr) return;
-      // Only add if not already in queue
-      if(q.some(i=>i.deck===deck)) return;
-      rows.push({
-        posId:def.id, posName:def.name, posIcon:def.icon, topColor:def.topColor, pnClass:def.pnClass,
-        deck, status:resultStr, rem:null, dur, position:null, queueLen:0
-      });
+      if(q.some(function(i){return String(i.deck)===String(deck);})) return;
+      rows.push({posId:def.id,posName:def.name,posIcon:def.icon,topColor:def.topColor,pnClass:def.pnClass,
+        deck,status:resultStr,rem:null,dur,position:null,queueLen:0});
     });
   });
-
-  // Filter
-  const filtered = filter==='all' ? rows :
-    filter==='active' ? rows.filter(r=>['playing','ready','called'].includes(r.status)) :
-    filter==='waiting' ? rows.filter(r=>r.status==='waiting') :
-    filter==='passed' ? rows.filter(r=>r.status==='passed') :
-    filter==='failed' ? rows.filter(r=>r.status==='failed') : rows;
-
-  // Stats
-  const stats = {
-    playing: rows.filter(r=>r.status==='playing'||r.status==='ready').length,
-    waiting: rows.filter(r=>r.status==='waiting').length,
-    passed:  rows.filter(r=>r.status==='passed').length,
-    failed:  rows.filter(r=>r.status==='failed').length,
-  };
-
-  const statusConfig = {
-    playing: {label:'Playing',    color:'var(--green)',  bg:'rgba(0,255,136,.1)',  icon:'ti-player-play'},
-    ready:   {label:'Ready',      color:'var(--blue)',   bg:'rgba(0,170,255,.1)',  icon:'ti-player-play'},
-    called:  {label:'Called',     color:'var(--amber)',  bg:'rgba(255,184,0,.1)',  icon:'ti-bell'},
-    waiting: {label:'Waiting',    color:'var(--text3)',  bg:'rgba(255,255,255,.05)',icon:'ti-clock'},
-    passed:  {label:'Passed',     color:'var(--green)',  bg:'rgba(0,255,136,.08)', icon:'ti-check'},
-    failed:  {label:'Failed',     color:'var(--red)',    bg:'rgba(255,68,68,.1)',  icon:'ti-x'},
-  };
-
-  const filterBtns = ['all','active','waiting','passed','failed'].map(f=>{
-    const labels = {all:'All',active:'Active',waiting:'Waiting',passed:'Passed',failed:'Failed'};
-    const active = filter===f;
-    return `<button onclick="setDashFilter('${f}')" style="padding:5px 12px;border-radius:3px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;letter-spacing:.5px;transition:all .15s;border:1px solid ${active?'var(--green)':'var(--border2)'};background:${active?'var(--green-dark)':'transparent'};color:${active?'var(--green)':'var(--text3)'};">${labels[f]}</button>`;
+  const filtered = filter==='all'?rows:filter==='active'?rows.filter(function(r){return ['playing','ready','called'].includes(r.status);}):filter==='waiting'?rows.filter(function(r){return r.status==='waiting';}):filter==='passed'?rows.filter(function(r){return r.status==='passed';}):filter==='failed'?rows.filter(function(r){return r.status==='failed';}):rows;
+  const stats={playing:rows.filter(function(r){return r.status==='playing'||r.status==='ready';}).length,waiting:rows.filter(function(r){return r.status==='waiting';}).length,passed:rows.filter(function(r){return r.status==='passed';}).length,failed:rows.filter(function(r){return r.status==='failed';}).length};
+  const statusConfig={playing:{label:'Playing',color:'var(--green)',bg:'rgba(0,255,136,.1)',icon:'ti-player-play'},ready:{label:'Ready',color:'var(--blue)',bg:'rgba(0,170,255,.1)',icon:'ti-player-play'},called:{label:'Called',color:'var(--amber)',bg:'rgba(255,184,0,.1)',icon:'ti-bell'},expired:{label:'Expired',color:'var(--amber)',bg:'rgba(255,184,0,.08)',icon:'ti-clock'},waiting:{label:'Waiting',color:'var(--text3)',bg:'rgba(255,255,255,.05)',icon:'ti-clock'},passed:{label:'Passed',color:'var(--green)',bg:'rgba(0,255,136,.08)',icon:'ti-check'},failed:{label:'Failed',color:'var(--red)',bg:'rgba(255,68,68,.1)',icon:'ti-x'}};
+  const filterBtns = ['all','active','waiting','passed','failed'].map(function(f){
+    const labels={all:'All',active:'Active',waiting:'Waiting',passed:'Passed',failed:'Failed'};
+    const active=filter===f;
+    return '<button onclick="setDashFilter(\''+f+'\')" style="padding:5px 12px;border-radius:3px;font-family:var(--font-ui);font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;letter-spacing:.5px;transition:all .15s;border:1px solid '+(active?'var(--green)':'var(--border2)')+';background:'+(active?'var(--green-dark)':'transparent')+';color:'+(active?'var(--green)':'var(--text3)')+';">'+labels[f]+'</button>';
   }).join('');
-
-  const tableRows = filtered.length ? filtered.map(row=>{
-    const sc = statusConfig[row.status]||{label:row.status,color:'var(--text3)',bg:'transparent',icon:'ti-circle'};
+  const tableRows = filtered.length ? filtered.map(function(row){
+    const sc=statusConfig[row.status]||{label:row.status,color:'var(--text3)',bg:'transparent',icon:'ti-circle'};
     const timerCell = row.status==='playing'&&row.rem!==null
-      ? `<span id="db-timer-${row.posId}" class="timer-display${row.rem<=30?' danger':row.rem<=(row.dur*60*.3)?' warning':''}" style="font-size:13px">${fmt(row.rem)}</span>`
-      : row.position ? `<span style="font-family:var(--font-mono);font-size:11px;color:var(--text3)">#${row.position} of ${row.queueLen}</span>` : '—';
-    return `<tr style="border-bottom:1px solid var(--border2)">
-      <td style="padding:8px 10px">
-        <div style="display:flex;align-items:center;gap:8px">
-          <div class="pos-num ${row.pnClass}" style="width:26px;height:26px;font-size:10px;flex-shrink:0">S${row.posId}</div>
-          <div>
-            <div style="font-size:12px;font-weight:700;color:var(--text)">${row.posName}</div>
-          </div>
-        </div>
-      </td>
-      <td style="padding:8px 10px;font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--text)">DECK ${row.deck}</td>
-      <td style="padding:8px 10px">
-        <span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:3px 10px;border-radius:2px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;font-family:var(--font-ui);background:${sc.bg};color:${sc.color};border:1px solid ${sc.color}33">
-          <i class="ti ${sc.icon}"></i> ${sc.label}
-        </span>
-      </td>
-      <td style="padding:8px 10px;text-align:right">${timerCell}</td>
-      <td style="padding:8px 10px;text-align:right;font-family:var(--font-mono);font-size:11px">
-        ${(row.status==='passed'||row.status==='failed')?
-          `<span style="color:${row.status==='passed'?'var(--green)':'var(--text3)'}">${fmtTs(getResultTs(row.deck,row.posId))}</span>`
-          :'—'}
-      </td>
-    </tr>`;
-  }).join('') : `<tr><td colspan="4" style="padding:2rem;text-align:center;color:var(--text3);font-family:var(--font-mono);font-size:12px">No data</td></tr>`;
-
-  el.innerHTML = `
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:1.25rem">
-      <div class="dash-card"><div class="dash-val" style="color:var(--green)">${stats.playing}</div><div class="dash-lbl">Playing</div></div>
-      <div class="dash-card"><div class="dash-val" style="color:var(--text3)">${stats.waiting}</div><div class="dash-lbl">Waiting</div></div>
-      <div class="dash-card"><div class="dash-val" style="color:var(--green)">${stats.passed}</div><div class="dash-lbl">Passed</div></div>
-      <div class="dash-card"><div class="dash-val" style="color:var(--red)">${stats.failed}</div><div class="dash-lbl">Failed</div></div>
-    </div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">${filterBtns}</div>
-    <div style="overflow-x:auto">
-      <table style="width:100%;border-collapse:collapse">
-        <thead>
-          <tr style="border-bottom:1px solid var(--border2)">
-            <th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">STATION</th>
-            <th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">DECK</th>
-            <th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">STATUS</th>
-            <th style="text-align:right;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">TIMER / POS</th>
-            <th style="text-align:right;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">COMPLETED</th>
-          </tr>
-        </thead>
-        <tbody>${tableRows}</tbody>
-      </table>
-    </div>`;
+      ? '<span id="db-timer-'+row.posId+'" class="timer-display'+(row.rem<=30?' danger':row.rem<=(row.dur*60*.3)?' warning':'')+'" style="font-size:13px">'+fmt(row.rem)+'</span>'
+      : row.position ? '<span style="font-family:var(--font-mono);font-size:11px;color:var(--text3)">#'+row.position+' of '+row.queueLen+'</span>' : '—';
+    const completedCell = (row.status==='passed'||row.status==='failed')
+      ? '<span style="color:'+(row.status==='passed'?'var(--green)':'var(--text3)')+'">'+fmtTs(getResultTs(row.deck,row.posId))+'</span>'
+      : '—';
+    return '<tr style="border-bottom:1px solid var(--border2)">'
+      +'<td style="padding:8px 10px"><div style="display:flex;align-items:center;gap:8px"><div class="pos-num '+row.pnClass+'" style="width:26px;height:26px;font-size:10px;flex-shrink:0">S'+row.posId+'</div><div style="font-size:12px;font-weight:700;color:var(--text)">'+row.posName+'</div></div></td>'
+      +'<td style="padding:8px 10px;font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--text)">DECK '+row.deck+'</td>'
+      +'<td style="padding:8px 10px"><span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:3px 10px;border-radius:2px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;font-family:var(--font-ui);background:'+sc.bg+';color:'+sc.color+';border:1px solid '+sc.color+'33"><i class="ti '+sc.icon+'"></i> '+sc.label+'</span></td>'
+      +'<td style="padding:8px 10px;text-align:right">'+timerCell+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;font-family:var(--font-mono);font-size:11px">'+completedCell+'</td>'
+      +'</tr>';
+  }).join('') : '<tr><td colspan="5" style="padding:2rem;text-align:center;color:var(--text3);font-family:var(--font-mono);font-size:12px">No data</td></tr>';
+  el.innerHTML = '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:1.25rem">'
+    +'<div class="dash-card"><div class="dash-val" style="color:var(--green)">'+stats.playing+'</div><div class="dash-lbl">Playing</div></div>'
+    +'<div class="dash-card"><div class="dash-val" style="color:var(--text3)">'+stats.waiting+'</div><div class="dash-lbl">Waiting</div></div>'
+    +'<div class="dash-card"><div class="dash-val" style="color:var(--green)">'+stats.passed+'</div><div class="dash-lbl">Passed</div></div>'
+    +'<div class="dash-card"><div class="dash-val" style="color:var(--red)">'+stats.failed+'</div><div class="dash-lbl">Failed</div></div>'
+    +'</div>'
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+filterBtns+'</div>'
+    +'<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">'
+    +'<thead><tr style="border-bottom:1px solid var(--border2)">'
+    +'<th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">STATION</th>'
+    +'<th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">DECK</th>'
+    +'<th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">STATUS</th>'
+    +'<th style="text-align:right;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">TIMER / POS</th>'
+    +'<th style="text-align:right;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">COMPLETED</th>'
+    +'</tr></thead>'
+    +'<tbody>'+tableRows+'</tbody></table></div>';
 }
 
 let _dashDebounce = null;
-function debounceDashboard(){
-  clearTimeout(_dashDebounce);
-  _dashDebounce = setTimeout(renderDashboard, 300);
-}
+function debounceDashboard(){ clearTimeout(_dashDebounce); _dashDebounce = setTimeout(renderDashboard, 300); }
+window.setDashFilter = function(f){ window._dashFilter=f; renderDashboard(); };
 
-window.setDashFilter = function(f){
-  window._dashFilter = f;
-  renderDashboard();
-};
-
-window.adminTab = function(name,btn){
-  document.querySelectorAll('#screen-admin .tab').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('#screen-admin .view').forEach(v=>v.classList.remove('active'));
-  if(btn) btn.classList.add('active');
-  document.getElementById('admin-view-'+name).classList.add('active');
-  if(name==='dashboard') renderDashboard();
-  if(name==='event') renderEventTimer();
-};
-
-// ── BOOK STEPS ──
-function resetSteps(){
-  const sc=document.getElementById('nav-scan-confirm'); if(sc) sc.style.display='none';
-  const ac=document.getElementById('nav-app-confirm'); if(ac) ac.style.display='none';
-  document.querySelectorAll('#nav-pos-list .pos-card').forEach(c=>c.classList.remove('sel'));
-}
-
-
-
-// ── EVENT TIMER ──
+// ── RENDER: EVENT TIMER ──
 function renderEventTimer(){
   const el = document.getElementById('admin-event-content'); if(!el) return;
-  const et = fbState.eventTimer || {};
+  const et = window._eventTimer||{};
   const running = et.running||false;
   const remSecs = running&&et.timerEnd ? Math.max(0,Math.round((et.timerEnd-Date.now())/1000)) : (et.totalSecs||7200);
   const totalSecs = et.totalSecs||7200;
   const pct = totalSecs>0?Math.round((remSecs/totalSecs)*100):100;
-  const fmtET = s=>{s=Math.max(0,s);return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
+  const fmtET = function(s){s=Math.max(0,s);return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
   const timerColor = remSecs<=300?'var(--red)':remSecs<=900?'var(--amber)':'var(--green)';
   const barColor = remSecs<=300?'tf-red':remSecs<=900?'tf-amber':'tf-green';
   const statusLabel = running?'<span style="font-size:10px;padding:3px 10px;border-radius:3px;background:rgba(0,255,136,.1);color:var(--green);border:1px solid rgba(0,255,136,.3)">RUNNING</span>':et.timerEnd&&remSecs<=0?'<span style="font-size:10px;padding:3px 10px;border-radius:3px;background:rgba(255,68,68,.1);color:var(--red);border:1px solid rgba(255,68,68,.3)">ENDED</span>':'<span style="font-size:10px;padding:3px 10px;border-radius:3px;background:rgba(255,255,255,.05);color:var(--text3);border:1px solid var(--border2)">IDLE</span>';
-
-  el.innerHTML = `
-    <div class="card">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:2px">EVENT COUNTDOWN</div>
-        ${statusLabel}
-      </div>
-      <div style="text-align:center;margin-bottom:16px">
-        <div id="et-display" style="font-family:var(--font-mono);font-size:56px;font-weight:600;letter-spacing:6px;line-height:1;color:${timerColor}">${fmtET(remSecs)}</div>
-        <div class="timer-bar" style="margin-top:12px"><div id="et-bar" class="timer-fill ${barColor}" style="width:${pct}%"></div></div>
-      </div>
-      <div style="background:var(--bg3);border-radius:4px;padding:12px 14px;margin-bottom:12px">
-        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-bottom:10px;letter-spacing:1px">SET DURATION</div>
-        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-          <button class="btn btn-sm" onclick="etSetPreset(120)"><i class="ti ti-clock"></i> 2 Hours</button>
-          <button class="btn btn-sm" style="color:var(--text3)">— or custom —</button>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px">
-          <input id="et-h" type="number" min="0" max="9" value="${Math.floor((et.totalSecs||7200)/3600)}" style="width:60px;text-align:center;padding:6px;font-family:var(--font-mono);font-size:14px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;color:var(--text)">
-          <span style="font-family:var(--font-mono);color:var(--text3)">h</span>
-          <input id="et-m" type="number" min="0" max="59" value="${Math.floor(((et.totalSecs||7200)%3600)/60)}" style="width:60px;text-align:center;padding:6px;font-family:var(--font-mono);font-size:14px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;color:var(--text)">
-          <span style="font-family:var(--font-mono);color:var(--text3)">m</span>
-        </div>
-      </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        ${!running?`<button class="btn btn-primary" style="flex:2" onclick="etStart()"><i class="ti ti-player-play"></i> Start Event Timer</button>`:`<button class="btn" style="flex:1;justify-content:center;border-color:rgba(255,184,0,.4);color:var(--amber)" onclick="etPause()"><i class="ti ti-player-pause"></i> Pause</button>`}
-        <button class="btn btn-red btn-sm" onclick="etReset()"><i class="ti ti-refresh"></i> Reset</button>
-      </div>
-      <div style="margin-top:10px;font-family:var(--font-mono);font-size:10px;color:var(--text3)">
-        <i class="ti ti-info-circle"></i> All navigators see this timer live · 15m left = logbook banner · 5m left = red alert
-      </div>
-    </div>`;
+  el.innerHTML = '<div class="card">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">'
+    +'<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:2px">EVENT COUNTDOWN</div>'
+    +statusLabel+'</div>'
+    +'<div style="text-align:center;margin-bottom:16px">'
+    +'<div id="et-display" style="font-family:var(--font-mono);font-size:56px;font-weight:600;letter-spacing:6px;line-height:1;color:'+timerColor+'">'+fmtET(remSecs)+'</div>'
+    +'<div class="timer-bar" style="margin-top:12px"><div id="et-bar" class="timer-fill '+barColor+'" style="width:'+pct+'%"></div></div>'
+    +'</div>'
+    +'<div style="background:var(--bg3);border-radius:4px;padding:12px 14px;margin-bottom:12px">'
+    +'<div style="font-family:var(--font-mono);font-size:10px;color:var(--text3);margin-bottom:10px;letter-spacing:1px">SET DURATION</div>'
+    +'<div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">'
+    +'<button class="btn btn-sm" onclick="etSetPreset(120)"><i class="ti ti-clock"></i> 2 Hours</button>'
+    +'<button class="btn btn-sm" style="color:var(--text3)">— or custom —</button>'
+    +'</div>'
+    +'<div style="display:flex;align-items:center;gap:8px">'
+    +'<input id="et-h" type="number" min="0" max="9" value="'+Math.floor((et.totalSecs||7200)/3600)+'" style="width:60px;text-align:center;padding:6px;font-family:var(--font-mono);font-size:14px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;color:var(--text)">'
+    +'<span style="font-family:var(--font-mono);color:var(--text3)">h</span>'
+    +'<input id="et-m" type="number" min="0" max="59" value="'+Math.floor(((et.totalSecs||7200)%3600)/60)+'" style="width:60px;text-align:center;padding:6px;font-family:var(--font-mono);font-size:14px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;color:var(--text)">'
+    +'<span style="font-family:var(--font-mono);color:var(--text3)">m</span>'
+    +'</div></div>'
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap">'
+    +(!running?'<button class="btn btn-primary" style="flex:2" onclick="etStart()"><i class="ti ti-player-play"></i> Start Event Timer</button>':'<button class="btn" style="flex:1;justify-content:center;border-color:rgba(255,184,0,.4);color:var(--amber)" onclick="etPause()"><i class="ti ti-player-pause"></i> Pause</button>')
+    +'<button class="btn btn-red btn-sm" onclick="etReset()"><i class="ti ti-refresh"></i> Reset</button>'
+    +'</div>'
+    +'<div style="margin-top:10px;font-family:var(--font-mono);font-size:10px;color:var(--text3)">'
+    +'<i class="ti ti-info-circle"></i> All navigators see this timer live · 15m left = logbook banner · 5m left = red alert'
+    +'</div></div>';
 }
 
-window.etSetPreset = function(mins){
-  const h=Math.floor(mins/60), m=mins%60;
-  const ih=document.getElementById('et-h'), im=document.getElementById('et-m');
-  if(ih) ih.value=h; if(im) im.value=m;
+// ── TABS ──
+window.navTab = function(name,btn){
+  document.querySelectorAll('#screen-nav .tab').forEach(function(t){t.classList.remove('active');});
+  document.querySelectorAll('#screen-nav .view').forEach(function(v){v.classList.remove('active');});
+  if(btn) btn.classList.add('active');
+  document.getElementById('nav-view-'+name).classList.add('active');
+  if(name==='reserve'||name==='book'){ renderFairnessBar(); renderPosList(); }
+  if(name==='tickets') renderTix();
+  if(name==='status') renderNavStatus();
 };
-window.etStart = async function(){
-  const h=parseInt(document.getElementById('et-h')?.value)||0;
-  const m=parseInt(document.getElementById('et-m')?.value)||0;
-  const totalSecs=(h*60+m)*60;
-  if(totalSecs<=0){showNotif('Set a duration first','warning');return;}
-  const timerEnd=Date.now()+totalSecs*1000;
-  await fbSet('eventTimer',{running:true,timerEnd,totalSecs,logbookOpen:false});
-  showNotif('Event timer started — '+h+'h '+m+'m','success');
-};
-window.etPause = async function(){
-  const et=fbState.eventTimer||{};
-  if(!et.running) return;
-  const remSecs=Math.max(0,Math.round((et.timerEnd-Date.now())/1000));
-  await fbSet('eventTimer',{running:false,timerEnd:null,totalSecs:remSecs,logbookOpen:et.logbookOpen||false});
-  showNotif('Event timer paused','warning');
-};
-window.etReset = async function(){
-  await fbSet('eventTimer',{running:false,timerEnd:null,totalSecs:7200,logbookOpen:false});
-  showNotif('Event timer reset','warning');
+window.adminTab = function(name,btn){
+  document.querySelectorAll('#screen-admin .tab').forEach(function(t){t.classList.remove('active');});
+  document.querySelectorAll('#screen-admin .view').forEach(function(v){v.classList.remove('active');});
+  if(btn) btn.classList.add('active');
+  document.getElementById('admin-view-'+name).classList.add('active');
+  if(name==='dashboard') renderDashboard();
+  if(name==='event') renderEventTimer();
 };
 
 // ── RESET ──
@@ -1436,9 +1385,7 @@ window.confirmReset = function(){
   btn.disabled=true; btn.style.opacity='.4'; btn.style.cursor='not-allowed';
   document.getElementById('reset-modal').style.display='flex';
 };
-window.closeReset = function(){
-  document.getElementById('reset-modal').style.display='none';
-};
+window.closeReset = function(){ document.getElementById('reset-modal').style.display='none'; };
 window.checkResetInput = function(){
   const ok = document.getElementById('reset-confirm-input').value==='RESET';
   const btn = document.getElementById('reset-confirm-btn');
@@ -1449,7 +1396,7 @@ window.doReset = async function(){
   showLoading('Resetting all data...');
   try {
     const updates={};
-    POS_DEFS.forEach(def=>{
+    POS_DEFS.forEach(function(def){
       updates['state/pos_'+def.id+'/queue']=null;
       updates['state/pos_'+def.id+'/timerRunning']=false;
       updates['state/pos_'+def.id+'/timerEnd']=null;
@@ -1458,16 +1405,49 @@ window.doReset = async function(){
     updates['results']=null;
     updates['presence']=null;
     updates['notifications']=null;
-    await fbSet('eventTimer',{running:false,timerEnd:null,totalSecs:7200,logbookOpen:false});
     await update(ref(db), updates);
+    await fbSet('eventTimer',{running:false,timerEnd:null,totalSecs:7200,logbookOpen:false});
     hideLoading(); closeReset();
     showNotif('All data has been reset','success');
   } catch(e){ hideLoading(); showNotif('Reset failed: '+e.message,'urgent'); }
 };
 
 // ── BOOT ──
+// Auto-login navigator if deck param in URL
+async function init(){
+  showLoading('Connecting...');
+  try {
+    const s = await fbGet('state');
+    if(!s){
+      const initState = {};
+      POS_DEFS.forEach(function(p){ initState['pos_'+p.id] = {duration:8,queue:{},timerRunning:false,timerEnd:null,nextNum:0,duoMode:false,activeDuo:false}; });
+      await fbSet('state', initState);
+    } else {
+      const migUpdates = {};
+      POS_DEFS.forEach(function(p){
+        const existing = s['pos_'+p.id] || {};
+        if(existing.duoMode === undefined) migUpdates['state/pos_'+p.id+'/duoMode'] = false;
+        if(existing.activeDuo === undefined) migUpdates['state/pos_'+p.id+'/activeDuo'] = false;
+      });
+      if(Object.keys(migUpdates).length) await update(ref(db), migUpdates);
+    }
+    fbState = (await fbGet('state')) || {};
+    cachedResults = (await fbGet('results')) || {};
+    window._eventTimer = (await fbGet('eventTimer')) || {};
+    hideLoading();
+    startGlobalTick();
+    const urlDeck = new URL(window.location.href).searchParams.get('deck');
+    if(urlDeck){
+      document.getElementById('nav-deck-input').value = urlDeck;
+      await window.navDeckConfirm();
+    } else {
+      showScreen('screen-role');
+    }
+  } catch(e){ hideLoading(); showNotif('Connection error: '+e.message,'urgent'); showScreen('screen-role'); }
+}
 
 init();
+
 </script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap');
