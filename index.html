@@ -464,6 +464,14 @@ window.startTimerSolo = async function(posId){
   showNotif('Solo session started — Deck '+q[0].deck,'success');
 };
 
+// ── ADMIN RESET DECK RESULT ──
+window.adminResetDeckResult = async function(posId, deckNum){
+  if(!confirm('Reset result for DECK '+deckNum+' at Station '+posId+'? This cannot be undone.')) return;
+  await fbDel('results/'+String(deckNum)+'/pos_'+posId);
+  showNotif('Result reset for Deck '+deckNum+' at S'+posId,'success');
+  renderDashboard();
+};
+
 window.adminEndSession = async function(posId, result, deckNum){
   const ps = getPosState(posId);
   const q = toArr(ps.queue);
@@ -1238,12 +1246,14 @@ function renderDashboard(){
     const completedCell = (row.status==='passed'||row.status==='failed')
       ? '<span style="color:'+(row.status==='passed'?'var(--green)':'var(--text3)')+'">'+fmtTs(getResultTs(row.deck,row.posId))+'</span>'
       : '—';
-    return '<tr style="border-bottom:1px solid var(--border2)">'
-      +'<td style="padding:8px 10px"><div style="display:flex;align-items:center;gap:8px"><div class="pos-num '+row.pnClass+'" style="width:26px;height:26px;font-size:10px;flex-shrink:0">S'+row.posId+'</div><div style="font-size:12px;font-weight:700;color:var(--text)">'+row.posName+'</div></div></td>'
+    const canReset = row.status==='passed'||row.status==='failed';
+    const resetBtn = canReset ? '<button onclick="adminResetDeckResult('+row.posId+',\''+row.deck+'\')" style="padding:3px 10px;border-radius:3px;font-family:var(--font-ui);font-size:10px;font-weight:700;cursor:pointer;background:transparent;color:var(--amber);border:1px solid rgba(255,184,0,.4)"><i class="ti ti-rotate"></i> Reset</button>' : '';
+    return '<tr style="border-bottom:1px solid var(--border2)">'      +'<td style="padding:8px 10px"><div style="display:flex;align-items:center;gap:8px"><div class="pos-num '+row.pnClass+'" style="width:26px;height:26px;font-size:10px;flex-shrink:0">S'+row.posId+'</div><div style="font-size:12px;font-weight:700;color:var(--text)">'+row.posName+'</div></div></td>'
       +'<td style="padding:8px 10px;font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--text)">DECK '+row.deck+'</td>'
       +'<td style="padding:8px 10px"><span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:3px 10px;border-radius:2px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;font-family:var(--font-ui);background:'+sc.bg+';color:'+sc.color+';border:1px solid '+sc.color+'33"><i class="ti '+sc.icon+'"></i> '+sc.label+'</span></td>'
       +'<td style="padding:8px 10px;text-align:right">'+timerCell+'</td>'
       +'<td style="padding:8px 10px;text-align:right;font-family:var(--font-mono);font-size:11px">'+completedCell+'</td>'
+      +'<td style="padding:8px 10px;text-align:right">'+resetBtn+'</td>'
       +'</tr>';
   }).join('') : '<tr><td colspan="5" style="padding:2rem;text-align:center;color:var(--text3);font-family:var(--font-mono);font-size:12px">No data</td></tr>';
   el.innerHTML = '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:1.25rem">'
@@ -1260,6 +1270,7 @@ function renderDashboard(){
     +'<th style="text-align:left;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">STATUS</th>'
     +'<th style="text-align:right;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">TIMER / POS</th>'
     +'<th style="text-align:right;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--text3);letter-spacing:1px">COMPLETED</th>'
+    +'<th style="padding:6px 10px"></th>'
     +'</tr></thead>'
     +'<tbody>'+tableRows+'</tbody></table></div>';
 }
@@ -1269,6 +1280,32 @@ function debounceDashboard(){ clearTimeout(_dashDebounce); _dashDebounce = setTi
 window.setDashFilter = function(f){ window._dashFilter=f; renderDashboard(); };
 
 // ── RENDER: EVENT TIMER ──
+window.etSetPreset = function(mins){
+  const ih=document.getElementById('et-h'), im=document.getElementById('et-m');
+  if(ih) ih.value=Math.floor(mins/60);
+  if(im) im.value=mins%60;
+};
+window.etStart = async function(){
+  const h=parseInt(document.getElementById('et-h')?.value)||0;
+  const m=parseInt(document.getElementById('et-m')?.value)||0;
+  const totalSecs=(h*60+m)*60;
+  if(totalSecs<=0){ showNotif('Set a duration first','warning'); return; }
+  const timerEnd=Date.now()+totalSecs*1000;
+  await fbSet('eventTimer',{running:true,timerEnd,totalSecs,logbookOpen:false});
+  showNotif('Event timer started — '+h+'h '+m+'m','success');
+};
+window.etPause = async function(){
+  const et=window._eventTimer||{};
+  if(!et.running) return;
+  const remSecs=Math.max(0,Math.round((et.timerEnd-Date.now())/1000));
+  await fbSet('eventTimer',{running:false,timerEnd:null,totalSecs:remSecs,logbookOpen:et.logbookOpen||false});
+  showNotif('Event timer paused','warning');
+};
+window.etReset = async function(){
+  await fbSet('eventTimer',{running:false,timerEnd:null,totalSecs:7200,logbookOpen:false});
+  showNotif('Event timer reset','warning');
+};
+
 function renderEventTimer(){
   const el = document.getElementById('admin-event-content'); if(!el) return;
   const et = window._eventTimer||{};
